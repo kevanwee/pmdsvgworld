@@ -15,7 +15,7 @@ const ROW_MAX = Math.floor((SVG_H - LEG_H) / TS) - 1;          // 16
 
 // ─── Battle / movement timing ─────────────────────────────────────────────────
 const STEP_DUR     = 0.20;   // seconds per tile  (constant for ALL pokemon)
-const WALK_TILES   = 14;     // one-way walk steps before encounter
+const WALK_TILES   = 26;     // one-way walk steps before encounter
 const PRE_DUR      = 0.20;   // stand facing each other
 const PHASE_DUR    = 0.55;   // one attack exchange (attacker + hurt overlap)
 const POST_DUR     = 0.20;   // brief disengage pause
@@ -294,8 +294,8 @@ function buildPokemonSVG(pkIdx, def, path, eA, eB, role, delaySec, spriteInfo) {
           atkUri,  atkSheetW,  atkSheetH,  atkFrameW,  atkFrameH,  atkFrameCount,  atkDurSec,
           hrtUri,  hrtSheetW,  hrtSheetH,  hrtFrameW,  hrtFrameH,  hrtFrameCount,  hrtDurSec } = spriteInfo;
 
-  // Sprite scale: use 2× for small frames so pokemon are clearly visible
-  const SC  = frameW <= 36 ? 2 : 1;
+  // Actual sprite size — position is pinned to tile centre, sprites can overflow tile bounds
+  const SC  = 1;
   const dfw = frameW * SC, dfh = frameH * SC;
   const hw  = dfw >> 1,    hh  = dfh >> 1;
 
@@ -351,7 +351,7 @@ function buildPokemonSVG(pkIdx, def, path, eA, eB, role, delaySec, spriteInfo) {
   // ── Attack sprite ─────────────────────────────────────────────────────────────
   let atkImg = '', hrtImg = '';
   if (atkUri && hrtUri) {
-    const aSC = atkFrameW <= 36 ? 2 : 1;
+    const aSC = 1;
     const adfw = atkFrameW * aSC, adfh = atkFrameH * aSC;
     const ahw  = adfw >> 1, ahh = adfh >> 1;
     const aClipId = `ac${pkIdx}`;
@@ -374,7 +374,7 @@ function buildPokemonSVG(pkIdx, def, path, eA, eB, role, delaySec, spriteInfo) {
   </image>`;
 
     // ── Hurt sprite ──────────────────────────────────────────────────────────────
-    const hSC = hrtFrameW <= 36 ? 2 : 1;
+    const hSC = 1;
     const hdfw = hrtFrameW * hSC, hdfh = hrtFrameH * hSC;
     const hhw  = hdfw >> 1, hhh = hdfh >> 1;
     const hClipId = `hc${pkIdx}`;
@@ -480,8 +480,8 @@ async function main() {
   ];
 
   const pkParts = [];
-  // Stagger pair start times so battles don't all happen simultaneously
-  const pairDelays = [0.5, PAIR_DUR * 0.34, PAIR_DUR * 0.68];
+  // Stagger pair start times spread wide across the cycle
+  const pairDelays = [0.5, PAIR_DUR * 0.42, PAIR_DUR * 0.78];
 
   for (let pairIdx = 0; pairIdx < 3; pairIdx++) {
     const [ridxA, ridxB] = pairRoomIdxs[pairIdx];
