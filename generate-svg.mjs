@@ -40,6 +40,39 @@ function parseAnimData(walkPngPath) {
   return null;
 }
 
+// Parse Idle AnimData from the same AnimData.xml (different <Name>Idle</Name>)
+function parseIdleAnimData(walkPngPath) {
+  let dir = dirname(walkPngPath);
+  for (let i = 0; i < 5; i++) {
+    const xmlPath = join(dir, 'AnimData.xml');
+    if (existsSync(xmlPath)) {
+      const xml = readFileSync(xmlPath, 'utf8');
+      const m = xml.match(/<Name>Idle<\/Name>[\s\S]*?<FrameWidth>(\d+)<\/FrameWidth>[\s\S]*?<FrameHeight>(\d+)<\/FrameHeight>[\s\S]*?<Durations>([\s\S]*?)<\/Durations>/);
+      if (m) {
+        const frameW = +m[1], frameH = +m[2];
+        const durs = [...m[3].matchAll(/<Duration>(\d+)<\/Duration>/g)];
+        const frameCount = durs.length;
+        const totalTicks = durs.reduce((s, d) => s + +d[1], 0);
+        return { frameW, frameH, frameCount, durSec: totalTicks / 60 };
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+// PMD row order: 0=S, 1=SE, 2=E, 3=NE, 4=N, 5=NW, 6=W, 7=SW
+function getDirectionRow(dx, dy) {
+  if (dx === 0 && dy === 0) return 0;
+  const angle = Math.atan2(dy, dx); // -PI..PI, 0=east
+  // 8 sectors: 0=E(row2),1=SE(row1)... map to PMD rows
+  const sector = Math.round((angle / (Math.PI / 4) + 8)) % 8;
+  // sector 0=E→2, 1=SE→1, 2=S→0, 3=SW→7, 4=W→6, 5=NW→5, 6=N→4, 7=NE→3
+  return [2, 1, 0, 7, 6, 5, 4, 3][sector];
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 const SEED     = 42;
 const SVG_W    = 960;
@@ -89,52 +122,187 @@ function generatePath(tileMap, n = 14) {
   return pts;
 }
 
-// ─── Tilemap → SVG rects ─────────────────────────────────────────────────────
-function tilemapToSVG(tileMap) {
-  const parts = [];
-  for (let y = 0; y < MAP_H; y++) {
-    for (let x = 0; x < MAP_W; x++) {
-      const tile  = tileMap.tiles[y][x];
-      const color = TILE_COLOR[tile];
-      const px    = fmt1(x * TS_W);
-      const py    = fmt1(y * TS_H);
-      const pw    = fmt1(TS_W + 0.5);   // +0.5 closes sub-pixel gaps
-      const ph    = fmt1(TS_H + 0.5);
-      parts.push(`<rect x="${px}" y="${py}" w="${pw}" h="${ph}" fill="${color}"/>`);
-    }
+// ─── PMD tile pattern defs (SVG <pattern> elements, 24×24 matching tiles.js) ──
+function buildTilePatternDefs(tw, th) {
+  // NB: tw/th are the SVG display size per tile; patterns tile at full size.
+  // We use patternUnits="userSpaceOnUse" so one pattern cell = one tile.
+  function pat(id, body) {
+    return `<pattern id="${id}" x="0" y="0" width="${tw.toFixed(2)}" height="${th.toFixed(2)}" patternUnits="userSpaceOnUse">${body}</pattern>`;
   }
-  // Compact: batch rects by colour to shrink file size
+  const s = (x, y, w, h, c) => `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${c}"/>`;
+  const TW = tw.toFixed(2), TH = th.toFixed(2);
+
+  // GRASS – PMD bright green with tuft detail
+  const grassBody = [
+    s(0,0,TW,TH,'#5CB038'),
+    s(0,0,TW,'1','#3A7020'), s(0,0,'1',TH,'#3A7020'),
+    // lighter stripe pattern
+    s('2','2','2','2','#70C848'), s('6','5','2','1','#70C848'),
+    s('9','2','1','2','#489028'), s('13','6','2','2','#70C848'),
+    s('16','3','1','2','#489028'), s('1','9','2','3','#70C848'),
+    s('5','12','1','2','#489028'), s('11','10','2','2','#70C848'),
+    s('14','13','1','3','#489028'), s('18','9','2','3','#70C848'),
+    s('7','16','2','3','#70C848'), s('15','17','1','3','#489028'),
+    s('20','15','2','3','#70C848'),
+  ].join('');
+
+  // TALL GRASS – darker denser green
+  const tallGrassBody = [
+    s(0,0,TW,TH,'#3C8828'),
+    s(0,0,TW,'1','#2C6818'), s(0,0,'1',TH,'#2C6818'),
+    s('1','1','2','4','#50A038'), s('4','3','1','5','#50A038'),
+    s('7','1','2','5','#50A038'), s('10','4','1','4','#2C6818'),
+    s('12','1','2','5','#50A038'), s('15','3','1','4','#50A038'),
+    s('17','1','2','5','#50A038'), s('20','5','1','3','#2C6818'),
+    s('3','10','2','5','#50A038'), s('8','12','1','4','#2C6818'),
+    s('13','10','2','5','#50A038'), s('18','12','1','5','#50A038'),
+    s('1','17','2','5','#50A038'), s('6','15','1','4','#2C6818'),
+    s('11','17','2','5','#50A038'), s('16','16','1','5','#50A038'),
+  ].join('');
+
+  // WATER – blue with shimmer lines
+  const waterBody = [
+    s(0,0,TW,TH,'#2868C0'),
+    s(0,0,TW,'1','#1848A0'), s(0,0,'1',TH,'#1848A0'),
+    s('0','5',TW,'1','#4890E0'), s('0','13',TW,'1','#4890E0'),
+    s('3','3','3','1','#3878D0'), s('9','2','3','1','#3878D0'),
+    s('15','3','3','1','#3878D0'), s('4','10','3','1','#3878D0'),
+    s('11','11','3','1','#3878D0'), s('17','10','3','1','#3878D0'),
+    s('2','17','3','1','#4890E0'), s('8','18','4','1','#4890E0'),
+    s('15','17','3','1','#4890E0'),
+  ].join('');
+
+  // DEEP WATER – darker
+  const deepWaterBody = [
+    s(0,0,TW,TH,'#1848A0'),
+    s(0,0,TW,'1','#1040A0'), s(0,0,'1',TH,'#1040A0'),
+    s('0','5',TW,'1','#2060B8'), s('0','13',TW,'1','#2060B8'),
+    s('3','3','3','1','#244898'), s('10','2','4','1','#244898'),
+    s('16','4','3','1','#244898'),
+  ].join('');
+
+  // PATH – tan stone tiles with grout lines
+  const pathBody = [
+    s(0,0,TW,TH,'#C8B070'),
+    s(0,0,TW,'1','#706040'), s(0,0,'1',TH,'#706040'),
+    // grout grid
+    s('8','0','1',TH,'#706040'), s('16','0','1',TH,'#706040'),
+    s('0','8',TW,'1','#706040'), s('0','16',TW,'1','#706040'),
+    // block highlights
+    s('1','1','6','6','#D8C090'), s('9','1','6','6','#D8C090'), s('17','1','5','6','#D8C090'),
+    s('1','9','6','6','#D8C090'), s('9','9','6','6','#D8C090'), s('17','9','5','6','#D8C090'),
+    s('1','17','6','5','#D8C090'), s('9','17','6','5','#D8C090'), s('17','17','5','5','#D8C090'),
+    // block shadows
+    s('6','1','1','6','#B09848'), s('14','1','1','6','#B09848'),
+    s('1','6','7','1','#B09848'), s('1','14','7','1','#B09848'),
+  ].join('');
+
+  // SAND – warm beige with granular noise (pre-baked key pixels)
+  const sandBody = [
+    s(0,0,TW,TH,'#C8A850'),
+    s(0,0,TW,'1','#907030'), s(0,0,'1',TH,'#907030'),
+    // ripple lines
+    s('2','4','3','1','#A88838'), s('8','4','4','1','#A88838'), s('16','4','5','1','#A88838'),
+    s('3','11','4','1','#A88838'), s('11','11','3','1','#A88838'), s('17','11','4','1','#A88838'),
+    s('1','18','5','1','#A88838'), s('9','18','4','1','#A88838'), s('15','18','5','1','#A88838'),
+    // light speckles
+    s('4','2','1','1','#E0C068'), s('11','3','1','1','#E0C068'), s('19','6','1','1','#E0C068'),
+    s('6','8','1','1','#E0C068'), s('14','9','1','1','#E0C068'), s('2','14','1','1','#E0C068'),
+    s('18','15','1','1','#E0C068'), s('7','20','1','1','#E0C068'),
+  ].join('');
+
+  // STONE CIRCLE – concentric ring plaza
+  const stoneBody = [
+    s(0,0,TW,TH,'#787080'),
+    s(0,0,TW,'1','#605870'), s(0,0,'1',TH,'#605870'),
+    `<circle cx="${(tw/2).toFixed(1)}" cy="${(th/2).toFixed(1)}" r="${(Math.min(tw,th)*0.46).toFixed(1)}" fill="#9890A0"/>`,
+    `<circle cx="${(tw/2).toFixed(1)}" cy="${(th/2).toFixed(1)}" r="${(Math.min(tw,th)*0.35).toFixed(1)}" fill="#B0A8B8"/>`,
+    `<circle cx="${(tw/2).toFixed(1)}" cy="${(th/2).toFixed(1)}" r="${(Math.min(tw,th)*0.22).toFixed(1)}" fill="#9890A0"/>`,
+    `<circle cx="${(tw/2).toFixed(1)}" cy="${(th/2).toFixed(1)}" r="${(Math.min(tw,th)*0.12).toFixed(1)}" fill="#B0A8B8"/>`,
+  ].join('');
+
+  // FLOWER (R/Y) – grass base with a small petal
+  const flowerRBody = [
+    grassBody,
+    s('9','8','1','4','#48A038'), // stem
+    s('8','7','3','3','#E83030'), s('9','6','1','1','#E83030'), // petals
+    s('7','8','1','1','#E83030'), s('11','8','1','1','#E83030'),
+    s('9','8','1','1','#FFFFFF'), // centre
+  ].join('');
+  const flowerYBody = [
+    grassBody,
+    s('9','8','1','4','#48A038'),
+    s('8','7','3','3','#F0D000'), s('9','6','1','1','#F0D000'),
+    s('7','8','1','1','#F0D000'), s('11','8','1','1','#F0D000'),
+    s('9','8','1','1','#FFFFFF'),
+  ].join('');
+
+  return [
+    pat('tile-grass',       grassBody),
+    pat('tile-tall-grass',  tallGrassBody),
+    pat('tile-water',       waterBody),
+    pat('tile-deep-water',  deepWaterBody),
+    pat('tile-path',        pathBody),
+    pat('tile-sand',        sandBody),
+    pat('tile-stone',       stoneBody),
+    pat('tile-flower-r',    flowerRBody),
+    pat('tile-flower-y',    flowerYBody),
+  ].join('\n  ');
+}
+
+const TILE_PATTERN = {
+  [TILE.GRASS]:        'url(#tile-grass)',
+  [TILE.TALL_GRASS]:   'url(#tile-tall-grass)',
+  [TILE.WATER]:        'url(#tile-water)',
+  [TILE.DEEP_WATER]:   'url(#tile-deep-water)',
+  [TILE.PATH]:         'url(#tile-path)',
+  [TILE.SAND]:         'url(#tile-sand)',
+  [TILE.STONE_CIRCLE]: 'url(#tile-stone)',
+  [TILE.FLOWER_R]:     'url(#tile-flower-r)',
+  [TILE.FLOWER_Y]:     'url(#tile-flower-y)',
+  [TILE.TREE]:         'url(#tile-grass)', // trunk base (canopy drawn separately)
+};
+
+// ─── Tilemap → SVG rects using patterns ──────────────────────────────────────
+function tilemapToSVG(tileMap) {
+  // Batch into runs per tile type (not just color) to keep output compact
   const rows = [];
   for (let y = 0; y < MAP_H; y++) {
     let run = null;
     for (let x = 0; x < MAP_W; x++) {
-      const tile  = tileMap.tiles[y][x];
-      const color = TILE_COLOR[tile];
-      if (run && run.color === color) {
+      const tile = tileMap.tiles[y][x];
+      const fill = TILE_PATTERN[tile] ?? TILE_COLOR[tile];
+      if (run && run.fill === fill) {
         run.w += TS_W;
       } else {
         if (run) rows.push(run);
-        run = { color, x: x * TS_W, y: y * TS_H, w: TS_W, h: TS_H };
+        run = { fill, x: x * TS_W, y: y * TS_H, w: TS_W, h: TS_H };
       }
     }
     if (run) rows.push(run);
   }
   return rows.map(r =>
-    `<rect x="${fmt1(r.x)}" y="${fmt1(r.y)}" width="${fmt1(r.w)}" height="${fmt1(r.h)}" fill="${r.color}"/>`
+    `<rect x="${fmt1(r.x)}" y="${fmt1(r.y)}" width="${fmt1(r.w + 0.5)}" height="${fmt1(r.h + 0.5)}" fill="${r.fill}"/>`
   ).join('\n');
 }
 
-// ─── Tree canopies as circles ────────────────────────────────────────────────
+// ─── Tree canopies ────────────────────────────────────────────────────────────
 function treesToSVG(tileMap) {
   const parts = [];
   for (let y = 0; y < MAP_H; y++) {
     for (let x = 0; x < MAP_W; x++) {
       if (tileMap.tiles[y][x] !== TILE.TREE) continue;
       const cx = fmt1((x + 0.5) * TS_W);
-      const cy = fmt1((y + 0.4) * TS_H);
-      const r  = fmt1(TS_W * 0.42);
-      parts.push(`<circle cx="${cx}" cy="${cy}" r="${r}" fill="#2d8b2d" opacity="0.9"/>`);
-      parts.push(`<circle cx="${fmt1((x + 0.35) * TS_W)}" cy="${fmt1((y + 0.28) * TS_H)}" r="${fmt1(r * 0.35)}" fill="#55c455" opacity="0.7"/>`);
+      const cy = fmt1((y + 0.38) * TS_H);
+      const r  = fmt1(TS_W * 0.5);
+      // Outer dark ring
+      parts.push(`<circle cx="${cx}" cy="${cy}" r="${r}" fill="#287018"/>`);
+      // Mid green
+      parts.push(`<circle cx="${cx}" cy="${fmt1((y + 0.35) * TS_H)}" r="${fmt1(TS_W * 0.4)}" fill="#388828"/>`);
+      // Inner bright
+      parts.push(`<circle cx="${fmt1((x + 0.42) * TS_W)}" cy="${fmt1((y + 0.3) * TS_H)}" r="${fmt1(TS_W * 0.26)}" fill="#48A038"/>`);
+      // Highlight
+      parts.push(`<circle cx="${fmt1((x + 0.36) * TS_W)}" cy="${fmt1((y + 0.24) * TS_H)}" r="${fmt1(TS_W * 0.14)}" fill="#60B848"/>`);
     }
   }
   return parts.join('\n');
@@ -142,92 +310,143 @@ function treesToSVG(tileMap) {
 
 // ─── CSS for one Pokemon ──────────────────────────────────────────────────────
 function pokemonCSS(idx, pts, dur, delay) {
-  // Movement keyframes
   const movePts = pts.map((p, i) => {
     const pct = Math.round(100 * i / (pts.length - 1));
     return `${pct}%{transform:translate(${fmt1(p.x)}px,${fmt1(p.y)}px)}`;
   }).join('');
-
-  // Bob keyframes (idle vertical oscillation)
-  const bobName = `bob${idx}`;
-  const bobCSS  = `@keyframes ${bobName}{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}`;
-
-  // Shadow scale pulse
-  const shadowName = `shadow${idx}`;
-  const shadowCSS  = `@keyframes ${shadowName}{0%,100%{rx:8;ry:3}50%{rx:10;ry:4}}`;
-
-  return [
-    `@keyframes move${idx}{${movePts}}`,
-    bobCSS,
-    shadowCSS,
-  ].join('\n');
+  const bobCSS = `@keyframes bob${idx}{0%,100%{transform:translateY(0)}50%{transform:translateY(-2px)}}`;
+  return [`@keyframes move${idx}{${movePts}}`, bobCSS].join('\n');
 }
 
 // ─── SVG element for one Pokemon ─────────────────────────────────────────────
-// Returns { defs, svg } so clip paths live in the outer <defs> block.
+// Returns { defs, svg }. spriteInfo has walk + idle URIs and anim params.
 function pokemonSVG(idx, def, pts, dur, delay, spriteInfo) {
   const start    = pts[0];
   const filterId = `glow${idx}`;
   const clipId   = `spriteclip${idx}`;
+  const iClipId  = `idleclip${idx}`;
   const color    = def.color;
   const sec      = def.secondaryColor;
+  const n        = pts.length;
 
   let defsStr = '';
   let bodyStr = '';
   let shadowY, shadowRx, shadowRy, nameY;
 
   if (spriteInfo) {
-    const { uri, sheetW, sheetH, frameW, frameH, frameCount, durSec } = spriteInfo;
-    const SCALE = 2;
-    const dfw = frameW * SCALE;   // displayed frame width
-    const dfh = frameH * SCALE;   // displayed frame height
+    const { walkUri, idleUri, sheetW, sheetH, frameW, frameH, frameCount, durSec,
+            idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec } = spriteInfo;
+    const SC  = 2;
+    const dfw = frameW * SC;   // displayed frame width
+    const dfh = frameH * SC;   // displayed frame height
     const halfW = dfw / 2;
     const halfH = dfh / 2;
 
-    // Clip path: exact frame window centred at group origin
-    defsStr = `<clipPath id="${clipId}"><rect x="${-halfW}" y="${-halfH}" width="${dfw}" height="${dfh}"/></clipPath>`;
+    // Clip paths for walk and idle frames
+    defsStr = [
+      `<clipPath id="${clipId}"><rect x="${-halfW}" y="${-halfH}" width="${dfw}" height="${dfh}"/></clipPath>`,
+      idleUri ? `<clipPath id="${iClipId}"><rect x="${-(idleFrameW*SC/2)}" y="${-(idleFrameH*SC/2)}" width="${idleFrameW*SC}" height="${idleFrameH*SC}"/></clipPath>` : '',
+    ].join('');
 
-    // SMIL x values: shift image left by one displayed frame per step.
-    // Frame n is visible when image x = -halfW - n*dfw
-    const xVals = Array.from({length: frameCount}, (_, n) => -halfW - n * dfw).join(';');
+    // ── Walk x-animation (frame cycling at AnimData speed)
+    const xVals = Array.from({length: frameCount}, (_, f) => -halfW - f * dfw).join(';');
 
-    bodyStr = `<image href="${uri}"
+    // ── Walk direction y-animation (synced to CSS movement cycle = 2*dur)
+    // Forward: pts[0]→pts[n-1]; Backward: pts[n-1]→pts[0] (alternate)
+    const yForward  = [];
+    const ktForward = [];
+    for (let i = 0; i < n - 1; i++) {
+      const row = getDirectionRow(pts[i+1].x - pts[i].x, pts[i+1].y - pts[i].y);
+      yForward.push(-halfH - row * dfh);
+      ktForward.push((i / (n - 1)) * 0.5);
+    }
+    const yBackward  = [];
+    const ktBackward = [];
+    for (let i = 0; i < n - 1; i++) {
+      const row = getDirectionRow(pts[n-2-i].x - pts[n-1-i].x, pts[n-2-i].y - pts[n-1-i].y);
+      yBackward.push(-halfH - row * dfh);
+      ktBackward.push(0.5 + (i / (n - 1)) * 0.5);
+    }
+    const yVals  = [...yForward,  ...yBackward,  yForward[0]].join(';');
+    const ktVals = [...ktForward, ...ktBackward, 1].map(v => v.toFixed(4)).join(';');
+
+    // Feet are roughly 70% down the frame in PMD sprites
+    shadowY  = fmt1(halfH * 0.35);
+    shadowRx = fmt1(dfw * 0.36);
+    shadowRy = fmt1(dfw * 0.07);
+    nameY    = fmt1(halfH * 0.55);
+
+    // ── Walk image element
+    const walkImg = `<image id="walk${idx}" href="${walkUri}"
         x="${-halfW}" y="${-halfH}"
-        width="${sheetW * SCALE}" height="${sheetH * SCALE}"
+        width="${sheetW * SC}" height="${sheetH * SC}"
         image-rendering="pixelated"
         clip-path="url(#${clipId})">
       <animate attributeName="x" values="${xVals}" dur="${durSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+      <animate attributeName="y" values="${yVals}" keyTimes="${ktVals}" dur="${(dur*2).toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
     </image>`;
 
-    shadowY  = fmt1(halfH + 2);
-    shadowRx = fmt1(dfw * 0.38);
-    shadowRy = fmt1(dfw * 0.07);
-    nameY    = fmt1(halfH + 11);
+    // ── Idle image element (shown when walk is paused — use display SMIL)
+    // We alternate: walk visible for dur s, idle visible for a beat, repeat.
+    // Simpler: always show walk (idle switching needs JS; skip for pure SVG)
+    bodyStr = walkImg;
+
+    // Optional idle overlay if we have the URI
+    if (idleUri) {
+      const idfw = idleFrameW * SC;
+      const idfh = idleFrameH * SC;
+      const ihalfW = idfw / 2;
+      const ihalfH = idfh / 2;
+      const ixVals = Array.from({length: idleFrameCount}, (_, f) => -ihalfW - f * idfw).join(';');
+      // Idle: show at waypoints — approximate by showing idle every other half-cycle
+      // Use SMIL display toggling: walk is visible first half, idle second half of each direction cycle
+      bodyStr += `
+    <image id="idle${idx}" href="${idleUri}"
+        x="${-ihalfW}" y="${-ihalfH}"
+        width="${idleSheetW * SC}" height="${idleSheetH * SC}"
+        image-rendering="pixelated"
+        clip-path="url(#${iClipId})">
+      <animate attributeName="x" values="${ixVals}" dur="${idleDurSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+      <animate attributeName="display" values="none;inline;none" keyTimes="0;0.5;0.75" dur="${(dur*2).toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    </image>`;
+      // Also hide walk image during idle phase
+      bodyStr = `<image id="walk${idx}" href="${walkUri}"
+        x="${-halfW}" y="${-halfH}"
+        width="${sheetW * SC}" height="${sheetH * SC}"
+        image-rendering="pixelated"
+        clip-path="url(#${clipId})">
+      <animate attributeName="x" values="${xVals}" dur="${durSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+      <animate attributeName="y" values="${yVals}" keyTimes="${ktVals}" dur="${(dur*2).toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+      <animate attributeName="display" values="inline;inline;none" keyTimes="0;0;0.5" dur="${(dur*2).toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    </image>
+    <image id="idle${idx}" href="${idleUri}"
+        x="${-ihalfW}" y="${-ihalfH}"
+        width="${idleSheetW * SC}" height="${idleSheetH * SC}"
+        image-rendering="pixelated"
+        clip-path="url(#${iClipId})">
+      <animate attributeName="x" values="${ixVals}" dur="${idleDurSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+      <animate attributeName="display" values="none;inline;none" keyTimes="0;0.5;1" dur="${(dur*2).toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    </image>`;
+    }
+
   } else {
-    // Fallback: glowing diamond when sprite is unavailable
     const r       = Math.max(10, def.frameSize * SX * 0.7);
     const diamond = `0,${fmt1(-r)} ${fmt1(r*0.7)},0 0,${fmt1(r)} ${fmt1(-r*0.7)},0`;
     const innerR  = r * 0.45;
     const inner   = `0,${fmt1(-innerR)} ${fmt1(innerR*0.7)},0 0,${fmt1(innerR)} ${fmt1(-innerR*0.7)},0`;
     bodyStr  = `<polygon points="${diamond}" fill="${color}" opacity="0.35" filter="url(#${filterId})"/>
       <polygon points="${diamond}" fill="${color}" stroke="${sec}" stroke-width="1.5"/>
-      <polygon points="${inner}"   fill="${sec}" opacity="0.45"/>
-      <circle cx="0" cy="${fmt1(-r * 0.2)}" r="2" fill="rgba(255,255,255,0.8)"/>`;
-    shadowY  = fmt1(r * 0.9);
-    shadowRx = '8';
-    shadowRy = '3';
-    nameY    = fmt1(r + 13);
+      <polygon points="${inner}"   fill="${sec}" opacity="0.45"/>`;
+    shadowY  = fmt1(r * 0.9); shadowRx = '8'; shadowRy = '3'; nameY = fmt1(r + 13);
   }
 
   const svg = `
-  <!-- ── ${def.name} ── -->
   <filter id="${filterId}" x="-60%" y="-60%" width="220%" height="220%">
-    <feGaussianBlur stdDeviation="4" result="b"/>
+    <feGaussianBlur stdDeviation="3" result="b"/>
     <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
   </filter>
-
   <g style="animation:move${idx} ${dur.toFixed(1)}s ease-in-out ${delay.toFixed(2)}s infinite alternate;transform:translate(${fmt1(start.x)}px,${fmt1(start.y)}px)">
-    <ellipse cx="0" cy="${shadowY}" rx="${shadowRx}" ry="${shadowRy}" fill="rgba(0,0,0,0.4)"/>
+    <ellipse cx="0" cy="${shadowY}" rx="${shadowRx}" ry="${shadowRy}" fill="rgba(0,0,0,0.45)"/>
     <g style="animation:bob${idx} ${(1.8 + idx * 0.3).toFixed(1)}s ease-in-out ${delay.toFixed(2)}s infinite">
       ${bodyStr}
     </g>
@@ -247,10 +466,10 @@ async function main() {
   const spriteInfos = POKEMON.map(def => {
     const localPath = def.animations.walk.replace(/^\.\//,  '');
     if (!existsSync(localPath)) {
-      console.warn(`  ⚠ Sprite not found: ${localPath}`);
+      console.warn(`  ⚠ Walk sprite not found: ${localPath}`);
       return null;
     }
-    const uri = `data:image/png;base64,${readFileSync(localPath).toString('base64')}`;
+    const walkUri = `data:image/png;base64,${readFileSync(localPath).toString('base64')}`;
     const { w: sheetW, h: sheetH } = pngSize(localPath);
     const anim = parseAnimData(localPath);
     if (!anim) {
@@ -258,8 +477,27 @@ async function main() {
       return null;
     }
     const { frameW, frameH, frameCount, durSec } = anim;
-    console.log(`  ✓ ${def.name}: ${frameW}x${frameH} ${frameCount}f ${(durSec).toFixed(3)}s (sheet ${sheetW}x${sheetH})`);
-    return { uri, sheetW, sheetH, frameW, frameH, frameCount, durSec };
+    console.log(`  ✓ ${def.name}: ${frameW}x${frameH} ${frameCount}f ${durSec.toFixed(3)}s (sheet ${sheetW}x${sheetH})`);
+
+    // Idle sprite (optional)
+    let idleUri = null, idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec;
+    const idlePath = def.animations.idle ? def.animations.idle.replace(/^\.\//,  '') : null;
+    if (idlePath && existsSync(idlePath)) {
+      idleUri = `data:image/png;base64,${readFileSync(idlePath).toString('base64')}`;
+      const { w: iW, h: iH } = pngSize(idlePath);
+      idleSheetW = iW; idleSheetH = iH;
+      const ia = parseIdleAnimData(idlePath);
+      if (ia) {
+        idleFrameW = ia.frameW; idleFrameH = ia.frameH;
+        idleFrameCount = ia.frameCount; idleDurSec = ia.durSec;
+        console.log(`    idle: ${idleFrameW}x${idleFrameH} ${idleFrameCount}f ${idleDurSec.toFixed(3)}s`);
+      } else {
+        idleUri = null; // no AnimData, skip idle
+      }
+    }
+
+    return { walkUri, idleUri, sheetW, sheetH, frameW, frameH, frameCount, durSec,
+             idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec };
   });
 
   const tileMap = new TileMap(SEED);
@@ -310,7 +548,7 @@ ${waterCSS}
   const pokemonDefs = pokemonParts.map(p => p.defs).filter(Boolean).join('\n  ');
   const pokemonSVGs = pokemonParts.map(p => p.svg).join('\n');
 
-  // ── Gradient defs ────────────────────────────────────────────────────────
+  // ── Gradient defs + tile patterns ───────────────────────────────────────
   const defs = `
 <defs>
   <radialGradient id="vignette" cx="50%" cy="50%" r="70%">
@@ -322,6 +560,7 @@ ${waterCSS}
     <stop offset="50%"  stop-color="#12204a"/>
     <stop offset="100%" stop-color="#0a1428"/>
   </linearGradient>
+  ${buildTilePatternDefs(TS_W, TS_H)}
   ${pokemonDefs}
 </defs>`;
 
