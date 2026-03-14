@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect width="128" height="128" fill="#0a1218" rx="16"/>
+  <!-- Diamond body (Diancie) -->
+  <polygon points="64,20 90,64 64,108 38,64" fill="#FF85C8" opacity="0.9"/>
+  <polygon points="64,28 84,64 64,100 44,64" fill="#FFE0F0" opacity="0.6"/>
+  <!-- Glow -->
+  <circle cx="64" cy="64" r="48" fill="none" stroke="#FF85C8" stroke-width="2" opacity="0.4"/>
+  <!-- Eye -->
+  <circle cx="64" cy="56" r="5" fill="white" opacity="0.9"/>
+  <!-- Star sparkles -->
+  <text x="18" y="30" font-size="14" fill="#FFD700">✦</text>
+  <text x="95" y="95" font-size="10" fill="#00ffaa">✦</text>
+  <text x="20" y="100" font-size="8"  fill="#3A7BFF">✦</text>
+</svg>
