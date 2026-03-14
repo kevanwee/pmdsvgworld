@@ -16,49 +16,65 @@ const ROW_MIN = 0;
 const ROW_MAX = MAP_H - 1;
 
 // ─── Battle / movement timing ─────────────────────────────────────────────────
-const STEP_DUR     = 0.20;    // seconds per tile (constant for ALL pokemon)
-const WALK_TILES   = 25;      // one-way walk steps (used by pair 0 / as default)
-// 4 exchange phases — varying durations for back-and-forth feel
+const STEP_DUR     = 0.20;    // seconds per tile
+// 4-phase battle exchange durations
 const PHASES       = [0.40, 0.60, 0.45, 0.55];
 const PRE_DUR      = 0.20;    // face-off pause before first strike
 const POST_DUR     = 0.25;    // disengage pause after last strike
 const BATTLE_TOTAL = PRE_DUR + PHASES.reduce((a, b) => a + b, 0) + POST_DUR; // 2.45 s
-// Each pair gets its own prime-ish cycle length → LCM(17,19,23) ≈ 7429s ≈ 2 hrs (never-ending)
-const SLEEP_DUR    = 6.55;    // pair 0 sleep — ~34% of 19s cycle
-const PAIR_DUR     = 2 * WALK_TILES * STEP_DUR + BATTLE_TOTAL + SLEEP_DUR;   // ≈19.00s
 
-// ─── Fractional phase boundaries (0-1 within PAIR_DUR) ───────────────────────
-const W_DUR  = WALK_TILES * STEP_DUR;   // 4.0 s
-const bs     = W_DUR / PAIR_DUR;                          // battle start
-const p0e    = bs   + PRE_DUR   / PAIR_DUR;               // pre-battle ends
-const p1e    = p0e  + PHASES[0] / PAIR_DUR;               // phase 0 ends (A attacked B)
-const p2e    = p1e  + PHASES[1] / PAIR_DUR;               // phase 1 ends (B attacked A)
-const p3e    = p2e  + PHASES[2] / PAIR_DUR;               // phase 2 ends (A attacked B)
-const p4e    = p3e  + PHASES[3] / PAIR_DUR;               // phase 3 ends (B attacked A)
-const be     = p4e  + POST_DUR  / PAIR_DUR;               // battle end, resume walk
-const bkend  = be   + W_DUR     / PAIR_DUR;               // backward walk done -> sleep
-
-// ─── Per-pair timing helper (prime cycle lengths → LCM ≈ 2 hours) ────────────
-function makeTiming(walkTiles, sleepDur) {
-  const pairDur = 2 * walkTiles * STEP_DUR + BATTLE_TOTAL + sleepDur;
-  const wDur = walkTiles * STEP_DUR;
-  const bs_    = wDur / pairDur;
-  const p0e_   = bs_   + PRE_DUR   / pairDur;
-  const p1e_   = p0e_  + PHASES[0] / pairDur;
-  const p2e_   = p1e_  + PHASES[1] / pairDur;
-  const p3e_   = p2e_  + PHASES[2] / pairDur;
-  const p4e_   = p3e_  + PHASES[3] / pairDur;
-  const be_    = p4e_  + POST_DUR  / pairDur;
-  const bkend_ = be_   + wDur      / pairDur;
-  return { pairDur, walkTiles, wDur, bs: bs_, p0e: p0e_, p1e: p1e_, p2e: p2e_,
-           p3e: p3e_, p4e: p4e_, be: be_, bkend: bkend_ };
+// ─── Per-pokemon independent cycle timing ─────────────────────────────────────
+// Each pokemon walks a multi-stop circuit; cycle = sum(leg tiles)*STEP_DUR + battle + brief rest.
+// Using prime-ish leg counts per pokemon so cycles never synchronise → near-infinite variation.
+// Layout of one cycle:
+//   leg0 walk (home→encounter1) | battle1 | leg1 walk (enc1→enc2) | battle2 | leg2 walk back | rest
+// rest is short (~15-18% of cycle) so pokemon spend most time moving.
+const REST_DUR = 3.5;   // brief rest at home between circuits
+//
+// makeCycleTiming(legs) where legs=[l0, l1, l2] tile counts
+function makeCycleTiming(legs) {
+  const walkTotal = legs.reduce((s, l) => s + l, 0);
+  const cycleDur  = walkTotal * STEP_DUR + 2 * BATTLE_TOTAL + REST_DUR;
+  // cumulative time fractions
+  const t = (s) => s / cycleDur;
+  let acc = 0;
+  const legEnds = legs.map(l => { acc += l * STEP_DUR; return t(acc); });
+  // battle 1 after leg 0
+  const b1s   = legEnds[0];
+  const b1p0e = b1s + t(PRE_DUR);
+  const b1p1e = b1p0e + t(PHASES[0]);
+  const b1p2e = b1p1e + t(PHASES[1]);
+  const b1p3e = b1p2e + t(PHASES[2]);
+  const b1p4e = b1p3e + t(PHASES[3]);
+  const b1e   = b1p4e + t(POST_DUR);
+  // leg 1
+  acc = b1e * cycleDur + legs[1] * STEP_DUR;
+  const b2s   = t(acc);
+  const b2p0e = b2s + t(PRE_DUR);
+  const b2p1e = b2p0e + t(PHASES[0]);
+  const b2p2e = b2p1e + t(PHASES[1]);
+  const b2p3e = b2p2e + t(PHASES[2]);
+  const b2p4e = b2p3e + t(PHASES[3]);
+  const b2e   = b2p4e + t(POST_DUR);
+  // leg 2 then rest
+  const restStart = Math.min(b2e + t(legs[2] * STEP_DUR), 0.9999);
+  return {
+    cycleDur, legs,
+    legEnds,
+    b1s, b1p0e, b1p1e, b1p2e, b1p3e, b1p4e, b1e,
+    b2s, b2p0e, b2p1e, b2p2e, b2p3e, b2p4e, b2e,
+    restStart,
+  };
 }
-// Different walkTiles per pair → irrational periods → LCM ≈ 2 hrs of unique variation
-// Sleep kept to ~21% of cycle so pokemon spend most of the time walking/fighting
-const PAIR_TIMINGS = [
-  makeTiming(27, 3.7),   // ≈16.95s — pair 0
-  makeTiming(32, 4.1),   // ≈19.35s — pair 1
-  makeTiming(38, 5.0),   // ≈22.65s — pair 2
+// Each pokemon has unique prime-ish legs → cycles never align → ~hours of unique variation
+// 6 pokemon, 6 distinct cycle lengths
+const POKEMON_CYCLES = [
+  makeCycleTiming([14, 11, 17]),  // ≈10.5s cycle
+  makeCycleTiming([19, 13, 16]),  // ≈13.1s cycle
+  makeCycleTiming([16, 17, 12]),  // ≈12.5s cycle
+  makeCycleTiming([13, 19, 14]),  // ≈12.3s cycle
+  makeCycleTiming([18, 12, 15]),  // ≈12.0s cycle
+  makeCycleTiming([11, 16, 19]),  // ≈12.3s cycle
 ];
 
 const SEED    = 42;
@@ -373,45 +389,52 @@ function waterAnimSVG(grid, W, H) {
   return lines.join('');
 }
 
-// ─── Build pair paths with collision avoidance ────────────────────────────────
-function buildPairPaths(rooms, grid, W, H, ridxA, ridxB, avoidTiles, hardBlocks, timing) {
-  const wt = timing.walkTiles;
-  const rA = rooms[ridxA], rB = rooms[ridxB];
-  const full = dijkstraPath(grid, W, H, rA.cx, rA.cy, rB.cx, rB.cy, avoidTiles, hardBlocks);
-  const K = full.length - 1;
-  const m = Math.max(1, K >> 1);
+// ─── Build a free-roaming circuit for one pokemon ────────────────────────────
+// Returns path: leg0 (home→enc1) + leg1 (enc1→enc2) + leg2 (enc2→home)
+// enc1Tile / enc2Tile are the meeting-point tiles for battle 1 and battle 2
+function buildCircuit(rooms, grid, W, H, homeRoomIdx, enc1RoomIdx, enc2RoomIdx, avoidTiles, hardBlocks, legs) {
+  const home = rooms[homeRoomIdx];
+  const enc1 = rooms[enc1RoomIdx];
+  const enc2 = rooms[enc2RoomIdx];
 
-  let pathA = full.slice(0, m + 1);
-  let pathB = full.slice(m + 1).reverse();
-  if (pathB.length < 2) pathB = [{ ...full[K] }, { ...full[K] }];
-
-  function normalisePath(path) {
-    while (path.length < wt + 1) path.unshift({ ...path[0] });
-    if (path.length > wt + 1) path = path.slice(path.length - (wt + 1));
-    return path;
+  function buildLeg(sx, sy, ex, ey, wantLen) {
+    const full = dijkstraPath(grid, W, H, sx, sy, ex, ey, avoidTiles, hardBlocks);
+    // Pad or trim to exact wantLen+1 points
+    let leg = [...full];
+    while (leg.length < wantLen + 1) leg.unshift({ ...leg[0] });
+    if (leg.length > wantLen + 1) leg = leg.slice(leg.length - (wantLen + 1));
+    leg.forEach(p => avoidTiles.add(`${p.x},${p.y}`));
+    return leg;
   }
-  pathA = normalisePath(pathA);
-  pathB = normalisePath(pathB);
 
-  // Register tiles so later pairs route around them (soft avoid)
-  pathA.forEach(p => avoidTiles.add(`${p.x},${p.y}`));
-  pathB.forEach(p => avoidTiles.add(`${p.x},${p.y}`));
-  // Hard-block home (sleep) tiles so later pairs never walk through them
-  hardBlocks.add(`${pathA[0].x},${pathA[0].y}`);
-  hardBlocks.add(`${pathB[0].x},${pathB[0].y}`);
+  const leg0 = buildLeg(home.cx, home.cy, enc1.cx, enc1.cy, legs[0]);
+  const leg1 = buildLeg(enc1.cx, enc1.cy, enc2.cx, enc2.cy, legs[1]);
+  const leg2 = buildLeg(enc2.cx, enc2.cy, home.cx, home.cy, legs[2]);
 
-  const avgYA = pathA.reduce((s, p) => s + p.y, 0) / pathA.length;
-  const avgYB = pathB.reduce((s, p) => s + p.y, 0) / pathB.length;
-  return { pathA, pathB, eA: pathA[wt], eB: pathB[wt], avgYA, avgYB };
+  hardBlocks.add(`${home.cx},${home.cy}`);
+
+  const avgY = [...leg0, ...leg1, ...leg2].reduce((s, p) => s + p.y, 0) /
+               (leg0.length + leg1.length + leg2.length);
+
+  return {
+    leg0, leg1, leg2,
+    enc1Tile: leg0[legs[0]],   // arrival tile at encounter 1
+    enc2Tile: leg1[legs[1]],   // arrival tile at encounter 2
+    homeTile: leg2[legs[2]],
+    avgY,
+  };
 }
 
-// ─── Build a single pokemon's full SMIL animation ────────────────────────────
-// role 'A' attacks in phases 0 & 2, role 'B' attacks in phases 1 & 3
-function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo, timing) {
+// ─── Build a single free-roaming pokemon's full SMIL animation ───────────────
+// circuit = { leg0, leg1, leg2, enc1Tile, enc2Tile }
+// opp1 = tile of encounter-1 opponent, opp2 = tile of encounter-2 opponent
+// role1 / role2 = 'A' or 'B' for each battle (A strikes in phase 0&2, B in 1&3)
+function buildPokemonSVG(pkIdx, delaySec, spriteInfo, cycle, circuit, opp1, opp2, role1, role2) {
   if (!spriteInfo) return { defs: '', svg: '' };
 
-  // Per-pair timing — override all globals
-  const { pairDur, walkTiles, bs, p0e, p1e, p2e, p3e, p4e, be, bkend } = timing;
+  const { cycleDur, legs, b1s, b1p0e, b1p1e, b1p2e, b1p3e, b1p4e, b1e,
+          b2s, b2p0e, b2p1e, b2p2e, b2p3e, b2p4e, b2e, restStart } = cycle;
+  const { leg0, leg1, leg2 } = circuit;
 
   const {
     walkUri, sheetW, sheetH, frameW, frameH, frameCount, durSec,
@@ -424,56 +447,79 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo, 
   const dfw = frameW, dfh = frameH;
   const hw  = dfw >> 1, hh = dfh >> 1;
 
-  // ── Position keyTimes and values ─────────────────────────────────────────────
-  const pathRev = [...path].reverse();
-
-  const allKts = [
-    ...Array.from({ length: walkTiles + 1 }, (_, i) => i * STEP_DUR / pairDur),
-    be,
-    ...Array.from({ length: walkTiles }, (_, i) => be + (i + 1) * STEP_DUR / pairDur),
-    1.0,
-  ];
-
+  // ── Build full keyTimes + positions across: leg0 | battle1 | leg1 | battle2 | leg2 | rest ──
+  // Each leg contributes (legLen) steps; battle phases hold position at encounter tile; rest at home.
+  const [l0, l1, l2] = legs;
   const pixPos = t => `${f1(t.x * TS + TS / 2)},${f1(t.y * TS + TS / 2)}`;
-  const allPos = [
-    ...path.map(pixPos),
-    pixPos(path[walkTiles]),
-    ...pathRev.slice(1).map(pixPos),
-    pixPos(path[0]),
-  ];
 
-  const ktStr  = allKts.map(f5).join(';');
-  const posStr = allPos.join(';');
+  const allKts = [];
+  const allPos = [];
+  const allDirRaw = [];  // {from, to} pairs for direction
 
-  // Walk direction Y-offset per keyframe (scaled)
-  const opponent = role === 'A' ? eB : eA;
+  const push = (kt, pos, from, to) => { allKts.push(kt); allPos.push(pos); allDirRaw.push({ from, to }); };
+
+  // Helper: add a leg's steps
+  function addLeg(leg, startFrac, stepFrac) {
+    for (let i = 0; i < leg.length; i++) {
+      const kt = startFrac + i * stepFrac;
+      const from = leg[i], to = leg[Math.min(i + 1, leg.length - 1)];
+      push(kt, pixPos(from), from, to);
+    }
+  }
+
+  const stepFrac = STEP_DUR / cycleDur;
+
+  // leg0: t=0 → b1s
+  addLeg(leg0, 0, stepFrac);
+  // battle1 hold at enc1Tile, facing opponent
+  const enc1 = circuit.enc1Tile;
+  push(b1s,   pixPos(enc1), enc1, opp1);
+  push(b1e,   pixPos(enc1), enc1, opp1);
+  // leg1: b1e → b2s
+  addLeg(leg1, b1e, stepFrac);
+  // battle2 hold at enc2Tile
+  const enc2 = circuit.enc2Tile;
+  push(b2s,   pixPos(enc2), enc2, opp2);
+  push(b2e,   pixPos(enc2), enc2, opp2);
+  // leg2: b2e → restStart
+  addLeg(leg2, b2e, stepFrac);
+  // rest at home — keyTime 1.0 closes the loop
+  push(1.0, pixPos(circuit.homeTile), circuit.homeTile, circuit.homeTile);
+
+  // Deduplicate + clamp keyTimes (must be strictly ascending, ≤1)
+  const merged = [];
+  for (let i = 0; i < allKts.length; i++) {
+    const kt = Math.min(allKts[i], 1.0);
+    if (merged.length > 0 && kt <= merged[merged.length - 1].kt) continue;
+    merged.push({ kt, pos: allPos[i], dir: allDirRaw[i] });
+  }
+  // Ensure last is exactly 1.0
+  if (merged[merged.length - 1].kt < 1.0)
+    merged.push({ kt: 1.0, ...merged[merged.length - 1] });
+
+  const ktStr  = merged.map(e => f5(e.kt)).join(';');
+  const posStr = merged.map(e => e.pos).join(';');
+
+  // Direction rows for walk sprite y-offset
   const dirY = (from, to) => -(hh + dirRow(to.x - from.x, to.y - from.y) * dfh) * SS;
-  const allDirY = [
-    ...Array.from({ length: walkTiles + 1 }, (_, i) => {
-      const from = path[i], to = path[Math.min(i + 1, walkTiles)];
-      return dirY(from, to);
-    }),
-    dirY(path[walkTiles], opponent),
-    ...Array.from({ length: walkTiles }, (_, i) => {
-      const from = pathRev[i + 1], to = pathRev[Math.min(i + 2, walkTiles)];
-      return dirY(from, to);
-    }),
-    -hh * SS,  // sleep: row 0
-  ];
+  const allDirY = merged.map(e => dirY(e.dir.from, e.dir.to));
 
   const clipId = `wc${pkIdx}`;
   let defsStr = `<clipPath id="${clipId}"><rect x="${-hw*SS}" y="${-hh*SS}" width="${dfw*SS}" height="${dfh*SS}"/></clipPath>`;
 
-  // ── Walk sprite ───────────────────────────────────────────────────────────────
+  // ── Walk sprite — visible except during battles ──────────────────────────────
   const walkXVals = Array.from({ length: frameCount }, (_, f) => -(hw + f * dfw) * SS).join(';');
+  // hide during battle1 (b1s→b1e) and battle2 (b2s→b2e) and rest (restStart→1)
+  const walkDisplayKt = `0;${f5(b1s)};${f5(b1e)};${f5(b2s)};${f5(b2e)};${f5(restStart)}`;
+  const walkDisplayV  = 'inline;none;inline;none;inline;none';
   const walkImg = `<image id="w${pkIdx}" href="${walkUri}"
       x="${-hw*SS}" y="${-hh*SS}" width="${sheetW*SS}" height="${sheetH*SS}" image-rendering="pixelated" clip-path="url(#${clipId})">
     <animate attributeName="x" values="${walkXVals}" dur="${durSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="y" values="${allDirY.join(';')}" keyTimes="${ktStr}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="display" values="inline;none;inline;none" keyTimes="0;${f5(bs)};${f5(be)};${f5(bkend)}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="y" values="${allDirY.join(';')}" keyTimes="${ktStr}" dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="${walkDisplayV}" keyTimes="${walkDisplayKt}" dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
 
-  // ── Strike / Hurt sprites ─────────────────────────────────────────────────────
+  // ── Strike sprites (one per battle) ──────────────────────────────────────────
   let strkImg = '', hrtImg = '', slpImg = '';
   if (strkUri && hrtUri) {
     const adfw = strkFrameW, adfh = strkFrameH;
@@ -481,80 +527,107 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo, 
     const aClipId = `ac${pkIdx}`;
     defsStr += `\n  <clipPath id="${aClipId}"><rect x="${-ahw*SS}" y="${-ahh*SS}" width="${adfw*SS}" height="${adfh*SS}"/></clipPath>`;
 
-    const strkFaceDir = role === 'A'
-      ? dirRow(eB.x - eA.x, eB.y - eA.y)
-      : dirRow(eA.x - eB.x, eA.y - eB.y);
-    const strkY = -(ahh + strkFaceDir * adfh) * SS;
-    const strkXVals = Array.from({ length: strkFrameCount }, (_, f) => -(ahw + f * adfw) * SS).join(';');
-    const strkKt = role === 'A'
-      ? `0;${f5(p0e)};${f5(p1e)};${f5(p2e)};${f5(p3e)}`
-      : `0;${f5(p1e)};${f5(p2e)};${f5(p3e)};${f5(p4e)}`;
+    function strkY(encTile, oppTile) {
+      const fd = dirRow(oppTile.x - encTile.x, oppTile.y - encTile.y);
+      return -(ahh + fd * adfh) * SS;
+    }
 
-    strkImg = `<image id="a${pkIdx}" href="${strkUri}"
-      x="${-ahw*SS}" y="${strkY}" width="${strkSheetW*SS}" height="${strkSheetH*SS}" image-rendering="pixelated" clip-path="url(#${aClipId})">
+    const strkXVals = Array.from({ length: strkFrameCount }, (_, f) => -(ahw + f * adfw) * SS).join(';');
+
+    // Role determines which phases this pokemon attacks vs gets hit
+    // battle1: role1; battle2: role2
+    const b1strkKt = role1 === 'A'
+      ? `0;${f5(b1p0e)};${f5(b1p1e)};${f5(b1p2e)};${f5(b1p3e)};1`
+      : `0;${f5(b1p1e)};${f5(b1p2e)};${f5(b1p3e)};${f5(b1p4e)};1`;
+    const b2strkKt = role2 === 'A'
+      ? `0;${f5(b2p0e)};${f5(b2p1e)};${f5(b2p2e)};${f5(b2p3e)};1`
+      : `0;${f5(b2p1e)};${f5(b2p2e)};${f5(b2p3e)};${f5(b2p4e)};1`;
+
+    const sy1 = strkY(enc1, opp1), sy2 = strkY(enc2, opp2);
+
+    // We can't change y dynamically between battles with a single image, so we use two images
+    const aClipId2 = `ac2_${pkIdx}`;
+    defsStr += `\n  <clipPath id="${aClipId2}"><rect x="${-ahw*SS}" y="${-ahh*SS}" width="${adfw*SS}" height="${adfh*SS}"/></clipPath>`;
+
+    strkImg = `<image href="${strkUri}" x="${-ahw*SS}" y="${sy1}" width="${strkSheetW*SS}" height="${strkSheetH*SS}" image-rendering="pixelated" clip-path="url(#${aClipId})">
     <animate attributeName="x" values="${strkXVals}" dur="${strkDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="display" values="none;inline;none;inline;none" keyTimes="${strkKt}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="none;inline;none" keyTimes="0;${f5(b1p0e)};${f5(b1e)}" dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+  </image>
+  <image href="${strkUri}" x="${-ahw*SS}" y="${sy2}" width="${strkSheetW*SS}" height="${strkSheetH*SS}" image-rendering="pixelated" clip-path="url(#${aClipId2})">
+    <animate attributeName="x" values="${strkXVals}" dur="${strkDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="none;inline;none" keyTimes="0;${f5(b2p0e)};${f5(b2e)}" dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
 
     const hdfw = hrtFrameW, hdfh = hrtFrameH;
-    const hhw = hdfw >> 1, hhh = hdfh >> 1;
+    const hhww = hdfw >> 1, hhhh = hdfh >> 1;
     const hClipId = `hc${pkIdx}`;
-    defsStr += `\n  <clipPath id="${hClipId}"><rect x="${-hhw*SS}" y="${-hhh*SS}" width="${hdfw*SS}" height="${hdfh*SS}"/></clipPath>`;
+    const hClipId2 = `hc2_${pkIdx}`;
+    defsStr += `\n  <clipPath id="${hClipId}"><rect x="${-hhww*SS}" y="${-hhhh*SS}" width="${hdfw*SS}" height="${hdfh*SS}"/></clipPath>`;
+    defsStr += `\n  <clipPath id="${hClipId2}"><rect x="${-hhww*SS}" y="${-hhhh*SS}" width="${hdfw*SS}" height="${hdfh*SS}"/></clipPath>`;
 
-    const hrtFaceDir = role === 'A'
-      ? dirRow(eB.x - eA.x, eB.y - eA.y)
-      : dirRow(eA.x - eB.x, eA.y - eB.y);
-    const hrtY = -(hhh + hrtFaceDir * hdfh) * SS;
-    const hrtXVals = Array.from({ length: hrtFrameCount }, (_, f) => -(hhw + f * hdfw) * SS).join(';');
-    const hrtKt = role === 'A'
-      ? `0;${f5(p1e)};${f5(p2e)};${f5(p3e)};${f5(p4e)}`
-      : `0;${f5(p0e)};${f5(p1e)};${f5(p2e)};${f5(p3e)}`;
+    function hrtDir(encTile, oppTile) {
+      return dirRow(oppTile.x - encTile.x, oppTile.y - encTile.y);
+    }
+    const hrtY1 = -(hhhh + hrtDir(enc1, opp1) * hdfh) * SS;
+    const hrtY2 = -(hhhh + hrtDir(enc2, opp2) * hdfh) * SS;
+    const hrtXVals = Array.from({ length: hrtFrameCount }, (_, f) => -(hhww + f * hdfw) * SS).join(';');
 
-    hrtImg = `<image id="h${pkIdx}" href="${hrtUri}"
-      x="${-hhw*SS}" y="${hrtY}" width="${hrtSheetW*SS}" height="${hrtSheetH*SS}" image-rendering="pixelated" clip-path="url(#${hClipId})">
+    const b1hrtKt = role1 === 'A'
+      ? `0;${f5(b1p1e)};${f5(b1p2e)};${f5(b1p3e)};${f5(b1p4e)};1`
+      : `0;${f5(b1p0e)};${f5(b1p1e)};${f5(b1p2e)};${f5(b1p3e)};1`;
+    const b2hrtKt = role2 === 'A'
+      ? `0;${f5(b2p1e)};${f5(b2p2e)};${f5(b2p3e)};${f5(b2p4e)};1`
+      : `0;${f5(b2p0e)};${f5(b2p1e)};${f5(b2p2e)};${f5(b2p3e)};1`;
+
+    hrtImg = `<image href="${hrtUri}" x="${-hhww*SS}" y="${hrtY1}" width="${hrtSheetW*SS}" height="${hrtSheetH*SS}" image-rendering="pixelated" clip-path="url(#${hClipId})">
     <animate attributeName="x" values="${hrtXVals}" dur="${hrtDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="display" values="none;inline;none;inline;none" keyTimes="${hrtKt}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="none;inline;none" keyTimes="0;${f5(b1p1e)};${f5(b1e)}" dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+  </image>
+  <image href="${hrtUri}" x="${-hhww*SS}" y="${hrtY2}" width="${hrtSheetW*SS}" height="${hrtSheetH*SS}" image-rendering="pixelated" clip-path="url(#${hClipId2})">
+    <animate attributeName="x" values="${hrtXVals}" dur="${hrtDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="none;inline;none" keyTimes="0;${f5(b2p1e)};${f5(b2e)}" dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
   }
 
-  // ── Sleep sprite ──────────────────────────────────────────────────────────────
+  // ── Sleep / rest sprite at home ───────────────────────────────────────────────
   if (slpUri) {
     const sfW = slpFrameW, sfH = slpFrameH;
-    const shw = sfW >> 1, shh = sfH >> 1;
+    const shww = sfW >> 1, shhh = sfH >> 1;
     const slpClipId = `sc${pkIdx}`;
-    defsStr += `\n  <clipPath id="${slpClipId}"><rect x="${-shw*SS}" y="${-shh*SS}" width="${sfW*SS}" height="${sfH*SS}"/></clipPath>`;
-    const slpXVals = Array.from({ length: slpFrameCount }, (_, f) => -(shw + f * sfW) * SS).join(';');
+    defsStr += `\n  <clipPath id="${slpClipId}"><rect x="${-shww*SS}" y="${-shhh*SS}" width="${sfW*SS}" height="${sfH*SS}"/></clipPath>`;
+    const slpXVals = Array.from({ length: slpFrameCount }, (_, f) => -(shww + f * sfW) * SS).join(';');
     slpImg = `<image id="s${pkIdx}" href="${slpUri}"
-      x="${-shw*SS}" y="${-shh*SS}" width="${slpSheetW*SS}" height="${slpSheetH*SS}" image-rendering="pixelated" clip-path="url(#${slpClipId})">
+      x="${-shww*SS}" y="${-shhh*SS}" width="${slpSheetW*SS}" height="${slpSheetH*SS}" image-rendering="pixelated" clip-path="url(#${slpClipId})">
     <animate attributeName="x" values="${slpXVals}" dur="${slpDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="display" values="none;inline" keyTimes="0;${f5(bkend)}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="none;inline;none" keyTimes="0;${f5(restStart)};1" dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
   }
 
-  // ── Hit-flash ─────────────────────────────────────────────────────────────────
-  const fd = 0.3 / pairDur;
-  const flashKt = role === 'A'
-    ? `0;${f5(p1e)};${f5(p1e+fd)};${f5(p2e)};${f5(p3e)};${f5(p3e+fd)};${f5(p4e)}`
-    : `0;${f5(p0e)};${f5(p0e+fd)};${f5(p1e)};${f5(p2e)};${f5(p2e+fd)};${f5(p3e)}`;
+  // ── Hit-flash circles for both battles ───────────────────────────────────────
+  const fd1 = 0.3 / cycleDur, fd2 = 0.3 / cycleDur;
   const flashImg = `<circle cx="0" cy="0" r="${TS * 0.7}" fill="white" opacity="0">
-    <animate attributeName="opacity" values="0;0;0.55;0;0;0.55;0" keyTimes="${flashKt}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>
+    <animate attributeName="opacity"
+      values="0;0;0.55;0;0;0.55;0;0;0.55;0;0;0.55;0"
+      keyTimes="0;${f5(b1p1e)};${f5(b1p1e+fd1)};${f5(b1p2e)};${f5(b1p3e)};${f5(b1p3e+fd1)};${f5(b1p4e)};${f5(b2p1e)};${f5(b2p1e+fd2)};${f5(b2p2e)};${f5(b2p3e)};${f5(b2p3e+fd2)};1"
+      dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>
   </circle>`;
 
-  const shadowY      = f1(hh * SS * 0.42);
-  const shadowRx     = f1(dfw * SS * 0.36);
-  const shadowRy     = f1(TS * 0.12);
-  const shadowYSleep = f1(hh * SS * 0.88);
-  const shadowRySleep = f1(TS * 0.07);
+  // ── Shadow ellipse ────────────────────────────────────────────────────────────
+  const shadowY   = f1(hh * SS * 0.42);
+  const shadowRx  = f1(dfw * SS * 0.36);
+  const shadowRy  = f1(TS * 0.12);
+  const shadowYS  = f1(hh * SS * 0.88);
+  const shadowRyS = f1(TS * 0.07);
   const shadowEll = `<ellipse cx="0" cy="${shadowY}" rx="${shadowRx}" ry="${shadowRy}" fill="rgba(0,0,0,0.55)">
-    <animate attributeName="cy" values="${shadowY};${shadowY};${shadowYSleep}" keyTimes="0;${f5(bkend)};1" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="ry" values="${shadowRy};${shadowRy};${shadowRySleep}" keyTimes="0;${f5(bkend)};1" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="cy" values="${shadowY};${shadowYS};${shadowY}" keyTimes="0;${f5(restStart)};1" dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="ry" values="${shadowRy};${shadowRyS};${shadowRy}" keyTimes="0;${f5(restStart)};1" dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
   </ellipse>`;
 
-  // ── ZZZ sleep bubbles ─────────────────────────────────────────────────────────
+  // ── ZZZ rest bubbles ──────────────────────────────────────────────────────────
   const zx1 = f1(dfw * SS * 0.25), zx2 = f1(dfw * SS * 0.40), zx3 = f1(dfw * SS * 0.55);
   const zy0 = f1(-hh * SS * 0.9);
   const zzzImg = `<g>
-    <animate attributeName="display" values="none;inline" keyTimes="0;${f5(bkend)}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="none;inline;none" keyTimes="0;${f5(restStart)};1" dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
     <text x="${zx1}" font-size="11" fill="white" font-family="monospace" font-weight="bold" text-anchor="middle">
       <animate attributeName="y" values="${zy0};${f1(-hh*SS*1.55)}" dur="1.8s" begin="${delaySec.toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>
       <animate attributeName="opacity" values="0;0.9;0" dur="1.8s" begin="${delaySec.toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>z</text>
@@ -570,7 +643,7 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo, 
   <g id="pk${pkIdx}">
     <animateTransform attributeName="transform" type="translate"
       values="${posStr}" keyTimes="${ktStr}"
-      dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
+      dur="${cycleDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
       calcMode="linear" repeatCount="indefinite" additive="replace"/>
     ${shadowEll}
     ${walkImg}
@@ -588,9 +661,12 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo, 
 async function main() {
   console.log('Generating PMD dungeon SVG ...');
   console.log(`  Map: ${MAP_W}x${MAP_H} tiles at ${TS}px`);
-  PAIR_TIMINGS.forEach((t, i) => console.log(`  Pair ${i}: ${t.walkTiles} tiles, pairDur=${t.pairDur.toFixed(2)}s, sleep=${(t.pairDur*(1-t.bkend)).toFixed(2)}s (${((1-t.bkend)*100).toFixed(0)}%)`));
+  POKEMON_CYCLES.forEach((c, i) => {
+    const restFrac = ((1 - c.restStart) * 100).toFixed(0);
+    console.log(`  pk${i}: cycleDur=${c.cycleDur.toFixed(2)}s  rest=${restFrac}%`);
+  });
 
-  // Load sprites: walk + strike + hurt + sleep
+  // ── Load sprites ────────────────────────────────────────────────────────────
   const spriteInfos = POKEMON.map(def => {
     const wp = (def.animations.walk ?? '').replace(/^\.\//, '');
     if (!wp || !existsSync(wp)) { console.warn(`  ! Walk missing: ${def.name}`); return null; }
@@ -615,7 +691,6 @@ async function main() {
     const st = loadAnim('strike');
     const hr = loadAnim('hurt');
     const sl = loadAnim('sleep');
-
     return {
       walkUri, sheetW: sW, sheetH: sH, ...wa,
       strkUri:       st?.uri,    strkSheetW: st?.sheetW, strkSheetH: st?.sheetH,
@@ -627,10 +702,7 @@ async function main() {
     };
   });
 
-  // ── Download dungeon tileset from PMDCollab/RawAsset ─────────────────────────
-  // SealedRuin tileset: 432×192 (18×8 tiles), 3 sections of 6×8
-  // Section 0 (wall): x 0–143  | Section 1 (water): x 144–287 | Section 2 (floor): x 288–431
-  // Row 6 (y=144) = interior surrounded tiles — good default for inner floor/wall
+  // ── Download dungeon tileset ─────────────────────────────────────────────────
   const DUNGEON_NAME = 'CrystalCave1';
   const TILESET_URL  = `https://raw.githubusercontent.com/PMDCollab/RawAsset/master/TileDtef/${DUNGEON_NAME}/tileset_0.png`;
   let tilesetUri = null;
@@ -642,61 +714,103 @@ async function main() {
     console.warn(`  ! Tileset download failed (${e.message}), using solid colours`);
   }
 
-  // Build pattern defs — multiple variants per type for visual variety
-  // CrystalCave1 layout: sec0 (wall) x=0-143, sec1 (water/corr) x=144-287, sec2 (floor) x=288-431
-  // Each section has 6 cols×8 rows of 24×24 tiles; row 6 (y=144) = fully-surrounded interior
   const patternDefs = tilesetUri ? [
-    // Wall interior variants — sec0, cols 2-5, row 6
     tilePattern('patWall0',     tilesetUri,  48, 144),
     tilePattern('patWall1',     tilesetUri,  72, 144),
     tilePattern('patWall2',     tilesetUri,  96, 144),
     tilePattern('patWall3',     tilesetUri, 120, 144),
-    // Wall edge variants (wall above open floor) — sec0, cols 2-3, row 1 (shows crystal tips)
     tilePattern('patWallEdge0', tilesetUri,  48,  24),
     tilePattern('patWallEdge1', tilesetUri,  72,  24),
-    // Floor variants — sec2, cols 3-5, row 6
     tilePattern('patFloor0',    tilesetUri, 360, 144),
     tilePattern('patFloor1',    tilesetUri, 384, 144),
     tilePattern('patFloor2',    tilesetUri, 408, 144),
-    // Corridor variants — sec2, cols 1-2, row 5
     tilePattern('patCorr0',     tilesetUri, 312, 120),
     tilePattern('patCorr1',     tilesetUri, 336, 120),
-    // Water — sec1, col 4, row 6
     tilePattern('patWater',     tilesetUri, 240, 144),
   ].join('\n  ') : '';
 
-  // Generate dungeon
+  // ── Generate dungeon ─────────────────────────────────────────────────────────
   const { grid, rooms, W, H } = generateDungeon();
   console.log(`  Dungeon: ${rooms.length} rooms (${W}x${H} tiles)`);
 
-  // Build paths with spatial collision avoidance (each pair prefers unused tiles)
+  // ── Build free-roaming circuits ───────────────────────────────────────────────
+  // 6 pokemon, each gets their own home room and 2 encounter rooms.
+  // Encounter rooms are deliberately shared so pokemon paths cross each other.
+  //
+  // 6×2 room grid (COLS=6):
+  //   row0: 0  1  2  3  4  5
+  //   row1: 6  7  8  9 10 11
+  //
+  // Assignment: each pokemon homes in one room; enc1 and enc2 are mid-dungeon
+  // rooms shared with other pokemon to create natural crossing points.
+  const circuits_def = [
+    // [homeRoomIdx, enc1RoomIdx, enc2RoomIdx]
+    [0,  3,  7],   // pk0: home top-left,  meets at rooms 3 & 7
+    [5,  2,  9],   // pk1: home top-right, meets at rooms 2 & 9
+    [11, 4,  8],   // pk2: home bot-right, meets at rooms 4 & 8
+    [6,  1, 10],   // pk3: home bot-left,  meets at rooms 1 & 10
+    [2,  7,  5],   // pk4: home top-mid,   meets at rooms 7 & 5
+    [9,  4,  0],   // pk5: home bot-mid,   meets at rooms 4 & 0
+  ];
+
+  // For each encounter room, the two pokemon who arrive there become opponents
+  // Build a lookup: roomIdx → list of {pkIdx, legIdx (0=enc1,1=enc2)}
+  const encRoom = {};  // roomIdx → [pkIdx, ...]
+  circuits_def.forEach(([home, e1, e2], pkIdx) => {
+    (encRoom[e1] = encRoom[e1] || []).push(pkIdx);
+    (encRoom[e2] = encRoom[e2] || []).push(pkIdx);
+  });
+
   const avoidTiles = new Set();
   const hardBlocks = new Set();
-  // 6×2 room layout: room idx = ry*COLS+rx, COLS=6, ROWS=2
-  // Assign pairs horizontally to keep pokemon in their Y-band → cleaner Z-depth
-  // Pair 0: top row (rooms 0 & 5), Pair 1: diagonal (rooms 1 & 10), Pair 2: bottom row (rooms 6 & 11)
-  const pairRoomIdxs = [
-    [0, 5],    // top-left ↔ top-right (stays in upper half)
-    [2, 9],    // top-mid ↔ bottom-mid (light diagonal for variety)
-    [6, 11],   // bottom-left ↔ bottom-right (stays in lower half)
-  ];
-  // Delays spaced to avoid >1 pair sleeping simultaneously (≤2 pokemon sleeping)
-  const pairDelays = [0.5, 8.0, 16.0];
+  const circuits = circuits_def.map(([home, e1, e2], pkIdx) => {
+    const cycle = POKEMON_CYCLES[pkIdx];
+    const circ = buildCircuit(rooms, grid, W, H, home, e1, e2, avoidTiles, hardBlocks, cycle.legs);
+    console.log(`  pk${pkIdx} ${POKEMON[pkIdx].name}: home=${home} enc1=${e1} enc2=${e2}`);
+    return circ;
+  });
 
-  const pkParts = [];
-  for (let pairIdx = 0; pairIdx < 3; pairIdx++) {
-    const [ridxA, ridxB] = pairRoomIdxs[pairIdx];
-    const timing = PAIR_TIMINGS[pairIdx];
-    const { pathA, pathB, eA, eB, avgYA, avgYB } = buildPairPaths(rooms, grid, W, H, ridxA, ridxB, avoidTiles, hardBlocks, timing);
-    const delay = pairDelays[pairIdx];
-    const idxA = pairIdx * 2, idxB = pairIdx * 2 + 1;
-    console.log(`  Pair ${pairIdx}: ${POKEMON[idxA].name} (room ${ridxA}) <-> ${POKEMON[idxB].name} (room ${ridxB})`);
-    pkParts.push({ ...buildPokemonSVG(idxA, POKEMON[idxA], pathA, eA, eB, 'A', delay, spriteInfos[idxA], timing), avgY: avgYA });
-    pkParts.push({ ...buildPokemonSVG(idxB, POKEMON[idxB], pathB, eA, eB, 'B', delay, spriteInfos[idxB], timing), avgY: avgYB });
+  // Determine opp1/opp2 tiles and roles for each pokemon per encounter room.
+  // For a room R, the two pokemon that arrive there fight each other.
+  // The pokemon with lower pkIdx is role 'A' (attacks first).
+  function getOpponentInRoom(roomIdx, myPkIdx) {
+    const visitors = encRoom[roomIdx] || [];
+    const other = visitors.find(p => p !== myPkIdx);
+    if (other === undefined) return null;
+    return other;
   }
 
-  // ── Y-sort: lower avgY (higher on screen) renders first → behind ──────────────
-  // Using average path Y gives accurate per-pair depth even for diagonal routes
+  // Stagger delays: spread pokemon start times by ~2s each for visual variety
+  const delays = [0.0, 2.1, 4.3, 6.5, 8.7, 10.9];
+
+  const pkParts = circuits.map((circuit, pkIdx) => {
+    const [, enc1RoomIdx, enc2RoomIdx] = circuits_def[pkIdx];
+
+    const opp1Idx = getOpponentInRoom(enc1RoomIdx, pkIdx);
+    const opp2Idx = getOpponentInRoom(enc2RoomIdx, pkIdx);
+
+    // Opponent tile = where the OTHER pokemon is at that encounter room
+    // If opp is using it as enc1, their enc1Tile; if enc2, their enc2Tile
+    function oppTileAt(oppIdx, roomIdx) {
+      if (oppIdx === null) return circuit.enc1Tile; // fallback: fight self (hidden)
+      const [, o1, o2] = circuits_def[oppIdx];
+      return o1 === roomIdx ? circuits[oppIdx].enc1Tile : circuits[oppIdx].enc2Tile;
+    }
+
+    const opp1Tile = oppTileAt(opp1Idx, enc1RoomIdx);
+    const opp2Tile = oppTileAt(opp2Idx, enc2RoomIdx);
+
+    const role1 = (opp1Idx === null || pkIdx < opp1Idx) ? 'A' : 'B';
+    const role2 = (opp2Idx === null || pkIdx < opp2Idx) ? 'A' : 'B';
+
+    return {
+      ...buildPokemonSVG(pkIdx, delays[pkIdx], spriteInfos[pkIdx],
+                         POKEMON_CYCLES[pkIdx], circuit, opp1Tile, opp2Tile, role1, role2),
+      avgY: circuit.avgY,
+    };
+  });
+
+  // ── Y-sort for correct Z-depth ────────────────────────────────────────────────
   pkParts.sort((a, b) => a.avgY - b.avgY);
 
   const pkDefs = pkParts.map(p => p.defs).filter(Boolean).join('\n  ');
@@ -736,4 +850,3 @@ async function main() {
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
-
