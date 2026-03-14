@@ -6,9 +6,39 @@
 // Pokemon are rendered as glowing diamond shapes (fallback-safe: no external images needed).
 // CSS @keyframes provide smooth movement and idle bob animations.
 
-import { writeFileSync, mkdirSync } from 'fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
+import { dirname, join } from 'path';
 import { TileMap } from './src/tilemap.js';
 import { TILE, TILE_COLOR, TILE_SIZE, MAP_W, MAP_H, CANVAS_W, CANVAS_H, POKEMON_DEFS } from './src/config.js';
+
+// ─── Sprite helpers ───────────────────────────────────────────────────────────
+function pngSize(filePath) {
+  const buf = readFileSync(filePath);
+  return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+}
+
+// Walk up from the sprite PNG's directory to find AnimData.xml, parse Walk dims.
+function parseAnimData(walkPngPath) {
+  let dir = dirname(walkPngPath);
+  for (let i = 0; i < 5; i++) {
+    const xmlPath = join(dir, 'AnimData.xml');
+    if (existsSync(xmlPath)) {
+      const xml = readFileSync(xmlPath, 'utf8');
+      const m = xml.match(/<Name>Walk<\/Name>[\s\S]*?<FrameWidth>(\d+)<\/FrameWidth>[\s\S]*?<FrameHeight>(\d+)<\/FrameHeight>[\s\S]*?<Durations>([\s\S]*?)<\/Durations>/);
+      if (m) {
+        const frameW = +m[1], frameH = +m[2];
+        const durs = [...m[3].matchAll(/<Duration>(\d+)<\/Duration>/g)];
+        const frameCount = durs.length;
+        const totalTicks = durs.reduce((s, d) => s + +d[1], 0);
+        return { frameW, frameH, frameCount, durSec: totalTicks / 60 };
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const SEED     = 42;
@@ -134,46 +164,62 @@ function pokemonCSS(idx, pts, dur, delay) {
 }
 
 // ─── SVG element for one Pokemon ─────────────────────────────────────────────
-function pokemonSVG(idx, def, pts, dur, delay) {
-  const start = pts[0];
-  const r     = Math.max(10, def.frameSize * SX * 0.7);   // display radius
-  const color = def.color;
-  const sec   = def.secondaryColor;
-
-  // Diamond shape as polygon
-  const diamond = [
-    `0,${-r}`,
-    `${r * 0.7},0`,
-    `0,${r}`,
-    `${-r * 0.7},0`,
-  ].join(' ');
-
-  // Inner highlight
-  const innerR = r * 0.45;
-  const inner  = [
-    `0,${-innerR}`,
-    `${innerR * 0.7},0`,
-    `0,${innerR}`,
-    `${-innerR * 0.7},0`,
-  ].join(' ');
-
+// Returns { defs, svg } so clip paths live in the outer <defs> block.
+function pokemonSVG(idx, def, pts, dur, delay, spriteInfo) {
+  const start    = pts[0];
   const filterId = `glow${idx}`;
-  const shadowId = `shadow${idx}`;
-
-  // Sprite image overlay (SpriteCollab – loads in browser; GitHub CSP will block but shape fallback shows)
-  const spriteW  = def.frameSize * 8;           // assumed 8 frames wide
-  const spriteH  = def.frameSize * 8;           // assumed 8 rows
-  const dispSize = r * 2.2;
   const clipId   = `spriteclip${idx}`;
-  const frameAnim = `@keyframes sf${idx}{from{transform:translateX(0)}to{transform:translateX(-${spriteW}px)}}`;
-  const spriteEl = `
-    <defs><clipPath id="${clipId}"><rect x="${fmt1(-r)}" y="${fmt1(-r * 0.9)}" width="${fmt1(def.frameSize)}" height="${fmt1(def.frameSize)}"/></clipPath></defs>
-    <image href="${def.animations.walk}" x="${fmt1(-r)}" y="${fmt1(-r * 0.9)}"
-      width="${spriteW}" height="${spriteH}"
-      clip-path="url(#${clipId})"
-      style="animation:sf${idx} 0.8s steps(8,end) ${delay.toFixed(2)}s infinite;transform-origin:${fmt1(-r)}px ${fmt1(-r * 0.9)}px"/>`;
+  const color    = def.color;
+  const sec      = def.secondaryColor;
 
-  return `
+  let defsStr = '';
+  let bodyStr = '';
+  let shadowY, shadowRx, shadowRy, nameY;
+
+  if (spriteInfo) {
+    const { uri, sheetW, sheetH, frameW, frameH, frameCount, durSec } = spriteInfo;
+    const SCALE = 2;
+    const dfw = frameW * SCALE;   // displayed frame width
+    const dfh = frameH * SCALE;   // displayed frame height
+    const halfW = dfw / 2;
+    const halfH = dfh / 2;
+
+    // Clip path: exact frame window centred at group origin
+    defsStr = `<clipPath id="${clipId}"><rect x="${-halfW}" y="${-halfH}" width="${dfw}" height="${dfh}"/></clipPath>`;
+
+    // SMIL x values: shift image left by one displayed frame per step.
+    // Frame n is visible when image x = -halfW - n*dfw
+    const xVals = Array.from({length: frameCount}, (_, n) => -halfW - n * dfw).join(';');
+
+    bodyStr = `<image href="${uri}"
+        x="${-halfW}" y="${-halfH}"
+        width="${sheetW * SCALE}" height="${sheetH * SCALE}"
+        image-rendering="pixelated"
+        clip-path="url(#${clipId})">
+      <animate attributeName="x" values="${xVals}" dur="${durSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+    </image>`;
+
+    shadowY  = fmt1(halfH + 2);
+    shadowRx = fmt1(dfw * 0.38);
+    shadowRy = fmt1(dfw * 0.07);
+    nameY    = fmt1(halfH + 11);
+  } else {
+    // Fallback: glowing diamond when sprite is unavailable
+    const r       = Math.max(10, def.frameSize * SX * 0.7);
+    const diamond = `0,${fmt1(-r)} ${fmt1(r*0.7)},0 0,${fmt1(r)} ${fmt1(-r*0.7)},0`;
+    const innerR  = r * 0.45;
+    const inner   = `0,${fmt1(-innerR)} ${fmt1(innerR*0.7)},0 0,${fmt1(innerR)} ${fmt1(-innerR*0.7)},0`;
+    bodyStr  = `<polygon points="${diamond}" fill="${color}" opacity="0.35" filter="url(#${filterId})"/>
+      <polygon points="${diamond}" fill="${color}" stroke="${sec}" stroke-width="1.5"/>
+      <polygon points="${inner}"   fill="${sec}" opacity="0.45"/>
+      <circle cx="0" cy="${fmt1(-r * 0.2)}" r="2" fill="rgba(255,255,255,0.8)"/>`;
+    shadowY  = fmt1(r * 0.9);
+    shadowRx = '8';
+    shadowRy = '3';
+    nameY    = fmt1(r + 13);
+  }
+
+  const svg = `
   <!-- ── ${def.name} ── -->
   <filter id="${filterId}" x="-60%" y="-60%" width="220%" height="220%">
     <feGaussianBlur stdDeviation="4" result="b"/>
@@ -181,33 +227,40 @@ function pokemonSVG(idx, def, pts, dur, delay) {
   </filter>
 
   <g style="animation:move${idx} ${dur.toFixed(1)}s ease-in-out ${delay.toFixed(2)}s infinite alternate;transform:translate(${fmt1(start.x)}px,${fmt1(start.y)}px)">
-    <!-- ground shadow -->
-    <ellipse cx="0" cy="${fmt1(r * 0.85)}" rx="8" ry="3" fill="rgba(0,0,0,0.3)" style="animation:shadow${idx} ${(dur * 0.12).toFixed(1)}s ease-in-out infinite alternate"/>
-
-    <!-- main body with bob animation -->
+    <ellipse cx="0" cy="${shadowY}" rx="${shadowRx}" ry="${shadowRy}" fill="rgba(0,0,0,0.4)"/>
     <g style="animation:bob${idx} ${(1.8 + idx * 0.3).toFixed(1)}s ease-in-out ${delay.toFixed(2)}s infinite">
-      <!-- glow/bloom -->
-      <polygon points="${diamond}" fill="${color}" opacity="0.35" filter="url(#${filterId})"/>
-      <!-- body -->
-      <polygon points="${diamond}" fill="${color}" stroke="${sec}" stroke-width="1.5"/>
-      <!-- inner shine -->
-      <polygon points="${inner}" fill="${sec}" opacity="0.45"/>
-      <!-- eye dot -->
-      <circle cx="0" cy="${fmt1(-r * 0.2)}" r="2" fill="rgba(255,255,255,0.8)"/>
-      <!-- sprite overlay (browser only) -->
-      ${spriteEl}
+      ${bodyStr}
     </g>
-
-    <!-- name tag -->
-    <text y="${fmt1(r + 13)}" text-anchor="middle"
+    <text y="${nameY}" text-anchor="middle"
       font-family="'Courier New',Courier,monospace" font-size="7"
       fill="white" stroke="black" stroke-width="2" paint-order="stroke">${def.name}</text>
   </g>`;
+
+  return { defs: defsStr, svg };
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 async function main() {
   console.log('Generating Pokemon World SVG …');
+
+  // Pre-load sprites as base64 data URIs (makes SVG fully self-contained)
+  const spriteInfos = POKEMON.map(def => {
+    const localPath = def.animations.walk.replace(/^\.\//,  '');
+    if (!existsSync(localPath)) {
+      console.warn(`  ⚠ Sprite not found: ${localPath}`);
+      return null;
+    }
+    const uri = `data:image/png;base64,${readFileSync(localPath).toString('base64')}`;
+    const { w: sheetW, h: sheetH } = pngSize(localPath);
+    const anim = parseAnimData(localPath);
+    if (!anim) {
+      console.warn(`  ⚠ No AnimData.xml for ${localPath}, skipping sprite`);
+      return null;
+    }
+    const { frameW, frameH, frameCount, durSec } = anim;
+    console.log(`  ✓ ${def.name}: ${frameW}x${frameH} ${frameCount}f ${(durSec).toFixed(3)}s (sheet ${sheetW}x${sheetH})`);
+    return { uri, sheetW, sheetH, frameW, frameH, frameCount, durSec };
+  });
 
   const tileMap = new TileMap(SEED);
 
@@ -221,11 +274,6 @@ async function main() {
     pokemonCSS(i, paths[i], durs[i], delays[i])
   ).join('\n');
 
-  // Extra sprite-frame CSS (needs to live inside <style>)
-  const spriteFrameCSS = POKEMON.map((def, i) =>
-    `@keyframes sf${i}{from{transform:translateX(0)}to{transform:translateX(-${def.frameSize * 8}px)}}`
-  ).join('\n');
-
   // Water ripple animation
   const waterCSS = `
 @keyframes ripple{0%,100%{opacity:.12}50%{opacity:.22}}
@@ -233,7 +281,6 @@ async function main() {
 
   const css = `<style>
 ${pokemonCSStyles}
-${spriteFrameCSS}
 ${waterCSS}
 </style>`;
 
@@ -257,9 +304,11 @@ ${waterCSS}
   }
 
   // ── Pokemon SVG elements ─────────────────────────────────────────────────
-  const pokemonSVGs = POKEMON.map((def, i) =>
-    pokemonSVG(i, def, paths[i], durs[i], delays[i])
-  ).join('\n');
+  const pokemonParts = POKEMON.map((def, i) =>
+    pokemonSVG(i, def, paths[i], durs[i], delays[i], spriteInfos[i])
+  );
+  const pokemonDefs = pokemonParts.map(p => p.defs).filter(Boolean).join('\n  ');
+  const pokemonSVGs = pokemonParts.map(p => p.svg).join('\n');
 
   // ── Gradient defs ────────────────────────────────────────────────────────
   const defs = `
@@ -273,6 +322,7 @@ ${waterCSS}
     <stop offset="50%"  stop-color="#12204a"/>
     <stop offset="100%" stop-color="#0a1428"/>
   </linearGradient>
+  ${pokemonDefs}
 </defs>`;
 
   // ── Title bar ─────────────────────────────────────────────────────────────

@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:sprites.pmdcollab.org)",
+      "WebSearch",
+      "WebFetch(domain:wiki.pmdo.pmdcollab.org)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(node generate-svg.mjs)",
+      "Bash(npm install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(where gh:*)",
+      "Bash(winget install:*)",
+      "WebFetch(domain:raks-olho.itch.io)",
+      "WebFetch(domain:www.spriters-resource.com)",
+      "WebFetch(domain:www.deviantart.com)",
+      "WebFetch(domain:pokemonmysteryuniverse.fandom.com)",
+      "WebFetch(domain:eddyk28.github.io)",
+      "WebFetch(domain:wiki.skytemple.org)",
+      "Bash(node -e \":*)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" auth login --with-token)",
+      "Bash(gh pr:*)"
+    ]
+  }
+}
