@@ -10,12 +10,14 @@
 
 export class SpriteSheet {
   /**
-   * @param {string} url
-   * @param {number} frameSize  – pixel width/height of one frame
-   * @param {number} fps        – target animation speed
-   * @param {string} fallbackColor – CSS colour for placeholder
+   * @param {string}  url
+   * @param {number}  frameSize   – pixel width/height of one frame
+   * @param {number}  fps         – target animation speed
+   * @param {string}  fallbackColor – CSS colour for placeholder
+   * @param {string|null} shinyTint – optional CSS colour overlay for shiny tinting
    */
-  constructor(url, frameSize = 24, fps = 8, fallbackColor = '#ff69b4') {
+  constructor(url, frameSize = 24, fps = 8, fallbackColor = '#ff69b4', shinyTint = null) {
+    this.shinyTint = shinyTint;
     this.frameSize     = frameSize;
     this.fps           = fps;
     this.fallbackColor = fallbackColor;
@@ -28,7 +30,7 @@ export class SpriteSheet {
     this._frame        = 0;
 
     this.image = new Image();
-    this.image.crossOrigin = 'anonymous';
+    if (location.protocol !== 'file:') this.image.crossOrigin = 'anonymous';
     this.image.onload = () => {
       this.loaded     = true;
       this.frameCount = Math.max(1, Math.round(this.image.naturalWidth  / this.frameSize));
