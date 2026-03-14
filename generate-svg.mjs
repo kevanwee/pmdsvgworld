@@ -4,14 +4,12 @@ import { POKEMON_DEFS } from './src/config.js';
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
 const SVG_W   = 960;
-const SVG_H   = 540;
-const TS      = 36;          // tile px — larger tiles for clearer display
-const MAP_W   = Math.floor(SVG_W / TS);   // 26
+const SVG_H   = 720;
+const TS      = 48;          // tile px
+const MAP_W   = Math.floor(SVG_W / TS);   // 20
 const MAP_H   = Math.floor(SVG_H / TS);   // 15
-const TITLE_H = 28;
-const LEG_H   = 22;
-const ROW_MIN = Math.ceil(TITLE_H / TS);                        // 1
-const ROW_MAX = Math.floor((SVG_H - LEG_H) / TS) - 1;          // 13
+const ROW_MIN = 0;
+const ROW_MAX = MAP_H - 1;
 
 // ─── Battle / movement timing ─────────────────────────────────────────────────
 const STEP_DUR     = 0.20;    // seconds per tile (constant for ALL pokemon)
@@ -184,9 +182,9 @@ function generateDungeon() {
 }
 
 // ─── Weighted Dijkstra — avoids tiles used by earlier pairs ───────────────────
-function dijkstraPath(grid, W, H, sx, sy, ex, ey, avoidTiles) {
-  const AVOID_COST = 4;
-  const ok = (x, y) => x >= 0 && x < W && y >= 0 && y < H && grid[y][x] !== T.WALL;
+function dijkstraPath(grid, W, H, sx, sy, ex, ey, avoidTiles, hardBlocks = new Set()) {
+  const AVOID_COST = 9999;
+  const ok = (x, y) => x >= 0 && x < W && y >= 0 && y < H && grid[y][x] !== T.WALL && !hardBlocks.has(`${x},${y}`);
   if (!ok(sx, sy) || !ok(ex, ey)) return [{ x: sx, y: sy }, { x: ex, y: ey }];
 
   const INF = 1e9;
@@ -208,6 +206,7 @@ function dijkstraPath(grid, W, H, sx, sy, ex, ey, avoidTiles) {
       const ni = ny * W + nx;
       const nd = d + 1 + (avoidTiles.has(`${nx},${ny}`) ? AVOID_COST : 0);
       if (nd < dist[ni]) { dist[ni] = nd; prev[ni] = idx; pq.push([nd, ni]); }
+
     }
   }
 
@@ -296,9 +295,9 @@ function waterAnimSVG(grid, W, H) {
 }
 
 // ─── Build pair paths with collision avoidance ────────────────────────────────
-function buildPairPaths(rooms, grid, W, H, ridxA, ridxB, avoidTiles) {
+function buildPairPaths(rooms, grid, W, H, ridxA, ridxB, avoidTiles, hardBlocks) {
   const rA = rooms[ridxA], rB = rooms[ridxB];
-  const full = dijkstraPath(grid, W, H, rA.cx, rA.cy, rB.cx, rB.cy, avoidTiles);
+  const full = dijkstraPath(grid, W, H, rA.cx, rA.cy, rB.cx, rB.cy, avoidTiles, hardBlocks);
   const K = full.length - 1;
   const m = Math.max(1, K >> 1);
 
@@ -314,16 +313,19 @@ function buildPairPaths(rooms, grid, W, H, ridxA, ridxB, avoidTiles) {
   pathA = normalisePath(pathA);
   pathB = normalisePath(pathB);
 
-  // Register tiles so later pairs route around them
+  // Register tiles so later pairs route around them (soft avoid)
   pathA.forEach(p => avoidTiles.add(`${p.x},${p.y}`));
   pathB.forEach(p => avoidTiles.add(`${p.x},${p.y}`));
+  // Hard-block home (sleep) tiles so later pairs never walk through them
+  hardBlocks.add(`${pathA[0].x},${pathA[0].y}`);
+  hardBlocks.add(`${pathB[0].x},${pathB[0].y}`);
 
   return { pathA, pathB, eA: pathA[WALK_TILES], eB: pathB[WALK_TILES] };
 }
 
 // ─── Build a single pokemon's full SMIL animation ────────────────────────────
 // role 'A' attacks in phases 0 & 2, role 'B' attacks in phases 1 & 3
-function buildPokemonSVG(pkIdx, def, path, eA, eB, role, delaySec, spriteInfo) {
+function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo) {
   if (!spriteInfo) return { defs: '', svg: '' };
 
   const {
@@ -461,7 +463,6 @@ function buildPokemonSVG(pkIdx, def, path, eA, eB, role, delaySec, spriteInfo) {
   const shadowY  = f1(hh * 0.42);
   const shadowRx = f1(dfw * 0.36);
   const shadowRy = f1(TS  * 0.12);
-  const nameY    = f1(-hh - 3);
 
   const svg = `
   <g id="pk${pkIdx}">
@@ -475,9 +476,6 @@ function buildPokemonSVG(pkIdx, def, path, eA, eB, role, delaySec, spriteInfo) {
     ${hrtImg}
     ${slpImg}
     ${flashImg}
-    <text y="${nameY}" text-anchor="middle"
-      font-family="'Courier New',monospace" font-size="7" font-weight="bold"
-      fill="white" stroke="${def.color}" stroke-width="2.5" paint-order="stroke">${def.name}</text>
   </g>`;
 
   return { defs: defsStr, svg };
@@ -532,6 +530,7 @@ async function main() {
 
   // Build paths with spatial collision avoidance (each pair prefers unused tiles)
   const avoidTiles = new Set();
+  const hardBlocks = new Set();
   const pairRoomIdxs = [
     [0, rooms.length - 1],
     [2, rooms.length - 3],
@@ -542,7 +541,7 @@ async function main() {
   const pkParts = [];
   for (let pairIdx = 0; pairIdx < 3; pairIdx++) {
     const [ridxA, ridxB] = pairRoomIdxs[pairIdx];
-    const { pathA, pathB, eA, eB } = buildPairPaths(rooms, grid, W, H, ridxA, ridxB, avoidTiles);
+    const { pathA, pathB, eA, eB } = buildPairPaths(rooms, grid, W, H, ridxA, ridxB, avoidTiles, hardBlocks);
     const delay = pairDelays[pairIdx];
     const idxA = pairIdx * 2, idxB = pairIdx * 2 + 1;
     console.log(`  Pair ${pairIdx}: ${POKEMON[idxA].name} (room ${ridxA}) <-> ${POKEMON[idxB].name} (room ${ridxB})`);
@@ -554,13 +553,6 @@ async function main() {
   const pkSVGs = pkParts.map(p => p.svg).join('\n');
   const dungeonSVG = dungeonToSVG(grid, W, H);
   const waterFX    = waterAnimSVG(grid, W, H);
-
-  const legY = SVG_H - LEG_H;
-  const legend = POKEMON.map((def, i) => {
-    const lx = 10 + i * Math.floor((SVG_W - 20) / POKEMON.length);
-    return `<circle cx="${lx+4}" cy="${legY+11}" r="4" fill="${def.color}"/>` +
-           `<text x="${lx+11}" y="${legY+15}" font-family="'Courier New',monospace" font-size="7" fill="#ccc">${def.name}</text>`;
-  }).join('');
 
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
@@ -574,11 +566,6 @@ async function main() {
     <stop offset="0%"   stop-color="transparent"/>
     <stop offset="100%" stop-color="rgba(0,0,14,0.62)"/>
   </radialGradient>
-  <linearGradient id="titlegrad" x1="0" x2="1">
-    <stop offset="0%"  stop-color="#080818"/>
-    <stop offset="50%" stop-color="#0E163A"/>
-    <stop offset="100%" stop-color="#080818"/>
-  </linearGradient>
   ${pkDefs}
 </defs>
 
@@ -587,15 +574,6 @@ async function main() {
 <g id="wfx" opacity="0.75">${waterFX}</g>
 <g id="npcs">${pkSVGs}</g>
 <rect width="${SVG_W}" height="${SVG_H}" fill="url(#vignette)" pointer-events="none"/>
-
-<rect x="0" y="0" width="${SVG_W}" height="${TITLE_H}" fill="url(#titlegrad)" opacity="0.96"/>
-<text x="${SVG_W/2}" y="18" text-anchor="middle"
-  font-family="'Courier New',Courier,monospace" font-size="11" font-weight="bold"
-  fill="#88DDFF" letter-spacing="2">&#9670; POKEMON MYSTERY DUNGEON WORLD &#9670;</text>
-<line x1="0" y1="${TITLE_H}" x2="${SVG_W}" y2="${TITLE_H}" stroke="#1A3060" stroke-width="1"/>
-
-<rect x="0" y="${legY}" width="${SVG_W}" height="${LEG_H}" fill="rgba(0,0,0,0.76)"/>
-${legend}
 </svg>
 `;
 
