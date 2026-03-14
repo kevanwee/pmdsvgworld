@@ -1,281 +1,250 @@
-import { readFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { POKEMON_DEFS } from './src/config.js';
 
-// ─── Config ───────────────────────────────────────────────────────────────────
-const SEED     = 42;
-const SVG_W    = 960;
-const SVG_H    = 540;
-const TS       = 20;          // tile size in SVG px
-const MAP_W    = SVG_W / TS;  // 48
-const MAP_H    = SVG_H / TS;  // 27
-const TITLE_H  = 28;
-const LEG_H    = 22;
-const PLAY_Y   = TITLE_H;               // playfield top
-const PLAY_H   = SVG_H - TITLE_H - LEG_H; // playfield height
+// ─── Constants ────────────────────────────────────────────────────────────────
+const SEED    = 42;
+const SVG_W   = 960;
+const SVG_H   = 540;
+const TS      = 20;           // tile size px
+const MAP_W   = SVG_W / TS;  // 48
+const MAP_H   = SVG_H / TS;  // 27
+const TITLE_H = 28;
+const LEG_H   = 22;
+// Playfield rows (tile coords) that are safe for dungeon rooms
+const ROW_MIN = Math.ceil(TITLE_H / TS);                        // 2
+const ROW_MAX = Math.floor((SVG_H - LEG_H) / TS) - 1;          // 24
 
-const POKEMON  = Object.values(POKEMON_DEFS);
+const POKEMON = Object.values(POKEMON_DEFS);
 
-// Tile type enum
+// Tile type constants
 const T = { WALL: 0, FLOOR: 1, CORR: 2, WATER: 3, STAIR: 5, ITEM: 6, TRAP: 7 };
 
-// ─── Seeded RNG ───────────────────────────────────────────────────────────────
+// ─── RNG ──────────────────────────────────────────────────────────────────────
 function makeRng(seed) {
   let s = seed >>> 0;
-  return () => {
-    s = Math.imul(1664525, s) + 1013904223 | 0;
-    return (s >>> 0) / 0x100000000;
-  };
+  return () => { s = Math.imul(1664525, s) + 1013904223 | 0; return (s >>> 0) / 0x100000000; };
 }
 const rng = makeRng(SEED * 31337);
-const ri  = (min, max) => Math.floor(rng() * (max - min)) + min;
-const rf  = (lo, hi)   => rng() * (hi - lo) + lo;
-const fmt1 = n => n.toFixed(1);
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const ri  = (lo, hi) => Math.floor(rng() * (hi - lo)) + lo;
+const rf  = (lo, hi) => rng() * (hi - lo) + lo;
 
 // ─── Sprite helpers ───────────────────────────────────────────────────────────
-function pngSize(filePath) {
-  const buf = readFileSync(filePath);
-  return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+function pngSize(fp) {
+  const b = readFileSync(fp);
+  return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) };
 }
 
-function parseAnim(walkPngPath, animName) {
-  let dir = dirname(walkPngPath);
+function parseAnim(pngPath, animName) {
+  let dir = dirname(pngPath);
   for (let i = 0; i < 5; i++) {
-    const xmlPath = join(dir, 'AnimData.xml');
-    if (existsSync(xmlPath)) {
-      const xml = readFileSync(xmlPath, 'utf8');
-      const pat = new RegExp(
+    const xp = join(dir, 'AnimData.xml');
+    if (existsSync(xp)) {
+      const xml = readFileSync(xp, 'utf8');
+      const m = xml.match(new RegExp(
         `<Name>${animName}<\\/Name>[\\s\\S]*?<FrameWidth>(\\d+)<\\/FrameWidth>[\\s\\S]*?<FrameHeight>(\\d+)<\\/FrameHeight>[\\s\\S]*?<Durations>([\\s\\S]*?)<\\/Durations>`
-      );
-      const m = xml.match(pat);
+      ));
       if (m) {
-        const frameW = +m[1], frameH = +m[2];
         const durs = [...m[3].matchAll(/<Duration>(\d+)<\/Duration>/g)];
-        const frameCount  = durs.length;
-        const totalTicks  = durs.reduce((s, d) => s + +d[1], 0);
-        return { frameW, frameH, frameCount, durSec: totalTicks / 60 };
+        return { frameW: +m[1], frameH: +m[2], frameCount: durs.length,
+                 durSec: durs.reduce((s, d) => s + +d[1], 0) / 60 };
       }
     }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
+    const p = dirname(dir); if (p === dir) break; dir = p;
   }
   return null;
 }
 
-// PMD row order: 0=S 1=SE 2=E 3=NE 4=N 5=NW 6=W 7=SW
+// PMD sprite sheet row: 0=S 1=SE 2=E 3=NE 4=N 5=NW 6=W 7=SW
 function dirRow(dx, dy) {
-  if (dx === 0 && dy === 0) return 0;
-  const ang    = Math.atan2(dy, dx);
-  const sector = Math.round((ang / (Math.PI / 4) + 8)) % 8;
-  return [2, 1, 0, 7, 6, 5, 4, 3][sector];
+  if (!dx && !dy) return 0;
+  const sec = Math.round((Math.atan2(dy, dx) / (Math.PI / 4) + 8)) % 8;
+  return [2, 1, 0, 7, 6, 5, 4, 3][sec];
 }
 
 // ─── Dungeon generator ────────────────────────────────────────────────────────
 function generateDungeon() {
   const W = MAP_W, H = MAP_H;
-  const grid = Array.from({ length: H }, () => new Uint8Array(W));  // all WALL=0
-
-  // Title bar + legend strip are HUD; We offset the dungeon inside the playfield.
-  // In tile coords: row 0..1 = title, row 25..26 = legend.
-  // Keep rooms inside rows 2..24 (inclusive) to stay within playfield.
-  const ROW_MIN = Math.ceil(TITLE_H / TS);           // 2
-  const ROW_MAX = Math.floor((SVG_H - LEG_H) / TS) - 1; // 24
+  const grid = Array.from({ length: H }, () => new Uint8Array(W)); // all WALL
 
   // 4 columns × 3 rows of sectors
   const COLS = 4, ROWS = 3;
-  const secW  = Math.floor(W / COLS);       // 12
-  const secH  = Math.floor((ROW_MAX - ROW_MIN + 1) / ROWS); // ~7
+  const secW = Math.floor(W / COLS);
+  const secH = Math.floor((ROW_MAX - ROW_MIN + 1) / ROWS);
   const rooms = [];
 
   for (let ry = 0; ry < ROWS; ry++) {
     for (let rx = 0; rx < COLS; rx++) {
       const sx = rx * secW;
       const sy = ROW_MIN + ry * secH;
-
-      const margin = 1;
-      const rw = ri(4, secW - margin * 2 - 1);
-      const rh = ri(3, secH - margin * 2);
-
-      const ox = sx + margin + ri(0, secW - margin * 2 - rw);
-      const oy = sy + margin + ri(0, secH - margin * 2 - rh);
-
-      for (let y = oy; y < oy + rh; y++) {
-        for (let x = ox; x < ox + rw; x++) {
-          if (y >= 0 && y < H && x >= 0 && x < W) grid[y][x] = T.FLOOR;
-        }
-      }
+      const rw = ri(4, secW - 2);
+      const rh = ri(3, secH - 1);
+      const ox = sx + 1 + ri(0, Math.max(1, secW - rw - 2));
+      const oy = sy + 1 + ri(0, Math.max(1, secH - rh - 1));
+      for (let y = oy; y < oy + rh && y < H; y++)
+        for (let x = ox; x < ox + rw && x < W; x++)
+          grid[y][x] = T.FLOOR;
       rooms.push({ x: ox, y: oy, w: rw, h: rh,
-                   cx: ox + Math.floor(rw / 2),
-                   cy: oy + Math.floor(rh / 2) });
+                   cx: ox + (rw >> 1), cy: oy + (rh >> 1) });
     }
   }
 
-  // L-shaped corridors: connect each room to the one to its right, and the one below
+  // Carve 1-tile-wide L-shaped corridor between two centers
   function carve(ax, ay, bx, by) {
-    // horizontal then vertical
-    const mx = ax < bx ? ax : bx;
-    for (let x = mx; x <= Math.max(ax, bx); x++) {
-      if (ay >= 0 && ay < H && x >= 0 && x < W) grid[ay][x] = T.CORR;
-    }
-    const my = ay < by ? ay : by;
-    for (let y = my; y <= Math.max(ay, by); y++) {
-      if (y >= 0 && y < H && bx >= 0 && bx < W) grid[y][bx] = T.CORR;
-    }
+    for (let x = Math.min(ax, bx); x <= Math.max(ax, bx); x++)
+      if (grid[ay]?.[x] !== undefined && grid[ay][x] === T.WALL) grid[ay][x] = T.CORR;
+    for (let y = Math.min(ay, by); y <= Math.max(ay, by); y++)
+      if (grid[y]?.[bx] !== undefined && grid[y][bx] === T.WALL) grid[y][bx] = T.CORR;
   }
 
   for (let ry = 0; ry < ROWS; ry++) {
     for (let rx = 0; rx < COLS; rx++) {
-      const cur = rooms[ry * COLS + rx];
-      if (rx + 1 < COLS) {
-        const right = rooms[ry * COLS + rx + 1];
-        carve(cur.cx, cur.cy, right.cx, right.cy);
-      }
-      if (ry + 1 < ROWS) {
-        const below = rooms[(ry + 1) * COLS + rx];
-        carve(cur.cx, cur.cy, below.cx, below.cy);
-      }
+      const c = rooms[ry * COLS + rx];
+      if (rx + 1 < COLS) { const r = rooms[ry * COLS + rx + 1]; carve(c.cx, c.cy, r.cx, r.cy); }
+      if (ry + 1 < ROWS) { const d = rooms[(ry + 1) * COLS + rx]; carve(c.cx, c.cy, d.cx, d.cy); }
     }
   }
 
-  // Water patches in up to 2 rooms
-  const waterRooms = [ri(0, rooms.length), ri(0, rooms.length)];
-  for (const ri2 of waterRooms) {
-    const r = rooms[ri2];
-    const wsx = r.x + 1, wsy = r.y + 1;
-    const wwx = Math.max(1, r.w - 2), wwy = Math.max(1, r.h - 2);
-    for (let y = wsy; y < wsy + wwy && y < H; y++) {
-      for (let x = wsx; x < wsx + wwx && x < W; x++) {
+  // Water patches in 2 rooms
+  for (let i = 0; i < 2; i++) {
+    const r = rooms[ri(0, rooms.length)];
+    for (let y = r.y + 1; y < r.y + r.h - 1 && y < H; y++)
+      for (let x = r.x + 1; x < r.x + r.w - 1 && x < W; x++)
         if (grid[y][x] === T.FLOOR) grid[y][x] = T.WATER;
-      }
-    }
   }
 
-  // Stair in last room
+  // Downstairs in last room; scatter items + traps
   const lr = rooms[rooms.length - 1];
   grid[lr.cy][lr.cx] = T.STAIR;
-
-  // 6 items/traps scattered in floor tiles
   let placed = 0;
-  for (let attempt = 0; attempt < 500 && placed < 6; attempt++) {
-    const rx2 = ri(0, W), ry2 = ri(0, H);
-    if (grid[ry2][rx2] === T.FLOOR) {
-      grid[ry2][rx2] = placed < 3 ? T.ITEM : T.TRAP;
-      placed++;
-    }
+  for (let a = 0; a < 500 && placed < 6; a++) {
+    const tx = ri(0, W), ty = ri(ROW_MIN, ROW_MAX + 1);
+    if (grid[ty][tx] === T.FLOOR) { grid[ty][tx] = placed++ < 3 ? T.ITEM : T.TRAP; }
   }
 
-  // Collect walkable cells (floor + corr)
-  const floorCells = [];
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      if (grid[y][x] === T.FLOOR || grid[y][x] === T.CORR) {
-        floorCells.push({ x, y });
+  return { grid, rooms, W, H };
+}
+
+// ─── BFS pathfind through walkable dungeon tiles ──────────────────────────────
+function bfsPath(grid, W, H, sx, sy, ex, ey) {
+  const isWalkable = (x, y) =>
+    x >= 0 && x < W && y >= 0 && y < H && grid[y][x] !== T.WALL;
+
+  if (!isWalkable(sx, sy) || !isWalkable(ex, ey))
+    return [{ x: sx, y: sy }, { x: ex, y: ey }];
+
+  const dist = new Int32Array(W * H).fill(-1);
+  const prev = new Int32Array(W * H).fill(-1);
+  const DIRS = [[1,0],[0,1],[-1,0],[0,-1]]; // cardinal only (PMD-authentic corridors)
+  const q = [];
+  const si = sy * W + sx;
+  dist[si] = 0;
+  q.push(si);
+
+  outer: for (let qi = 0; qi < q.length; qi++) {
+    const idx = q[qi];
+    if (idx === ey * W + ex) break outer;
+    const cx = idx % W, cy = (idx / W) | 0;
+    for (const [ddx, ddy] of DIRS) {
+      const nx = cx + ddx, ny = cy + ddy, ni = ny * W + nx;
+      if (isWalkable(nx, ny) && dist[ni] === -1) {
+        dist[ni] = dist[idx] + 1;
+        prev[ni] = idx;
+        q.push(ni);
       }
     }
   }
 
-  return { grid, rooms, floorCells, W, H };
+  const path = [];
+  let cur = ey * W + ex;
+  while (cur !== -1 && cur !== si) { path.push({ x: cur % W, y: (cur / W) | 0 }); cur = prev[cur]; }
+  path.push({ x: sx, y: sy });
+  return path.reverse();
 }
 
-// ─── Tile patterns ────────────────────────────────────────────────────────────
+// ─── PMD EoS dungeon tile patterns ────────────────────────────────────────────
 function buildTilePatterns(ts) {
-  const s = (x, y, w, h, c) =>
-    `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${c}"/>`;
+  const s = (x, y, w, h, c) => `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${c}"/>`;
+  const pat = (id, body) =>
+    `<pattern id="${id}" x="0" y="0" width="${ts}" height="${ts}" patternUnits="userSpaceOnUse">${body}</pattern>`;
 
-  function pat(id, body) {
-    return `<pattern id="${id}" x="0" y="0" width="${ts}" height="${ts}" patternUnits="userSpaceOnUse">${body}</pattern>`;
-  }
-
-  // WALL — dark navy with subtle brick grid
+  // PMD EoS blue-purple dungeon palette
+  // WALL — very dark purple with slight inner detail
   const wallBody = [
-    s(0, 0, ts, ts, '#1A1A2E'),
-    s(0, 0, ts, 1, '#0D0D1A'),
-    s(0, 0, 1, ts, '#0D0D1A'),
-    s(1, 1, ts/2 - 2, ts/2 - 2, '#222238'),
-    s(ts/2, ts/2, ts/2 - 1, ts/2 - 1, '#222238'),
-    s(ts/2 + 2, 3, 2, 2, '#2A2A44'),
-    s(4, ts/2 + 3, 2, 2, '#2A2A44'),
+    s(0, 0, ts, ts, '#1E1533'),
+    s(1, 1, ts - 2, ts - 2, '#231A3C'),
   ].join('');
 
-  // FLOOR — warm tan stone with 2×2 grout grid
+  // FLOOR — blue-gray stone with 1px grout borders around each tile
+  // Bevel effect: top-left edges lighter, bottom-right edges slightly darker
   const floorBody = [
-    s(0, 0, ts, ts, '#8B7D6B'),
-    s(0, 0, ts, 1, '#6B5E50'),
-    s(0, 0, 1, ts, '#6B5E50'),
-    s(ts/2, 0, 1, ts, '#6B5E50'),
-    s(0, ts/2, ts, 1, '#6B5E50'),
-    s(2, 2, ts/2 - 3, ts/2 - 3, '#9B8D7B'),
-    s(ts/2 + 2, 2, ts/2 - 3, ts/2 - 3, '#9B8D7B'),
-    s(2, ts/2 + 2, ts/2 - 3, ts/2 - 3, '#9B8D7B'),
-    s(ts/2 + 2, ts/2 + 2, ts/2 - 3, ts/2 - 3, '#9B8D7B'),
+    s(0, 0, ts, ts, '#404A78'),           // grout / outer border color
+    s(1, 1, ts - 2, ts - 2, '#6878A8'),   // main stone fill
+    s(1, 1, ts - 2, 1, '#8090C0'),        // top highlight
+    s(1, 1, 1, ts - 2, '#8090C0'),        // left highlight
+    s(1, ts - 2, ts - 2, 1, '#505888'),   // bottom shadow
+    s(ts - 2, 1, 1, ts - 2, '#505888'),   // right shadow
   ].join('');
 
-  // CORRIDOR — darker stone
+  // CORRIDOR — slightly darker/more muted than floor
   const corrBody = [
-    s(0, 0, ts, ts, '#6B5E50'),
-    s(0, 0, ts, 1, '#5A4E42'),
-    s(0, 0, 1, ts, '#5A4E42'),
-    s(2, 2, ts - 4, ts - 4, '#7A6D5E'),
+    s(0, 0, ts, ts, '#363E68'),
+    s(1, 1, ts - 2, ts - 2, '#505878'),
+    s(1, 1, ts - 2, 1, '#606888'),        // top highlight
+    s(1, 1, 1, ts - 2, '#606888'),        // left highlight
   ].join('');
 
-  // WATER — PMD-style blue shimmer
+  // WATER — PMD blue with shimmer lines
   const waterBody = [
-    s(0, 0, ts, ts, '#1A5CC8'),
-    s(0, 0, ts, 1, '#1040A0'),
-    s(0, ts * 0.3, ts, 2, '#4484E8'),
-    s(0, ts * 0.7, ts, 2, '#4484E8'),
-    s(ts * 0.15, ts * 0.15, ts * 0.3, 1, '#6FA8F0'),
-    s(ts * 0.55, ts * 0.55, ts * 0.3, 1, '#6FA8F0'),
+    s(0, 0, ts, ts, '#2A52B8'),
+    s(0, Math.round(ts * 0.28), ts, 2, '#4878DC'),
+    s(0, Math.round(ts * 0.62), ts, 2, '#4878DC'),
+    s(Math.round(ts * 0.10), Math.round(ts * 0.12), Math.round(ts * 0.38), 1, '#80A8F0'),
+    s(Math.round(ts * 0.52), Math.round(ts * 0.52), Math.round(ts * 0.38), 1, '#80A8F0'),
   ].join('');
 
-  // STAIR — yellow floor tile with ↓ arrow
+  // STAIR — golden floor with down-arrow
   const stairBody = [
-    floorBody,
-    s(ts * 0.3, ts * 0.2, ts * 0.4, ts * 0.6, '#F0D000'),
-    s(ts * 0.2, ts * 0.6, ts * 0.6, ts * 0.2, '#F0D000'),
-    `<polygon points="${ts*0.5},${ts*0.85} ${ts*0.25},${ts*0.6} ${ts*0.75},${ts*0.6}" fill="#C8A800"/>`,
+    s(0, 0, ts, ts, '#404A78'),
+    s(1, 1, ts - 2, ts - 2, '#907838'),
+    s(1, 1, ts - 2, 1, '#C0A848'),
+    s(1, 1, 1, ts - 2, '#C0A848'),
+    `<polygon points="${ts * 0.50},${ts * 0.78} ${ts * 0.30},${ts * 0.48} ${ts * 0.70},${ts * 0.48}" fill="#503010"/>`,
+    s(Math.round(ts * 0.44), Math.round(ts * 0.22), Math.round(ts * 0.12), Math.round(ts * 0.28), '#503010'),
   ].join('');
 
-  // ITEM — floor with gold orb
+  // ITEM — blue floor with golden orb
   const itemBody = [
-    floorBody,
-    `<circle cx="${ts*0.5}" cy="${ts*0.5}" r="${ts*0.28}" fill="#FFD700" stroke="#C8A800" stroke-width="1"/>`,
-    `<circle cx="${ts*0.42}" cy="${ts*0.42}" r="${ts*0.08}" fill="white" opacity="0.6"/>`,
+    s(0, 0, ts, ts, '#404A78'),
+    s(1, 1, ts - 2, ts - 2, '#6878A8'),
+    `<circle cx="${ts * 0.50}" cy="${ts * 0.50}" r="${ts * 0.27}" fill="#FFD040" stroke="#B89020" stroke-width="0.5"/>`,
+    `<circle cx="${ts * 0.40}" cy="${ts * 0.40}" r="${ts * 0.09}" fill="white" opacity="0.55"/>`,
   ].join('');
 
-  // TRAP — floor with red triangle
+  // TRAP — blue floor with red warning triangle
   const trapBody = [
-    floorBody,
-    `<polygon points="${ts*0.5},${ts*0.18} ${ts*0.82},${ts*0.76} ${ts*0.18},${ts*0.76}" fill="rgba(200,0,0,0.8)" stroke="#800000" stroke-width="1"/>`,
-    `<text x="${ts*0.5}" y="${ts*0.65}" text-anchor="middle" font-size="${ts*0.32}" fill="white">!</text>`,
+    s(0, 0, ts, ts, '#404A78'),
+    s(1, 1, ts - 2, ts - 2, '#6878A8'),
+    `<polygon points="${ts * 0.50},${ts * 0.20} ${ts * 0.80},${ts * 0.76} ${ts * 0.20},${ts * 0.76}" fill="rgba(180,0,0,0.9)" stroke="#600000" stroke-width="0.5"/>`,
+    `<text x="${ts * 0.50}" y="${ts * 0.65}" text-anchor="middle" font-size="${Math.round(ts * 0.30)}" fill="white" font-weight="bold">!</text>`,
   ].join('');
 
   return [
-    pat('t-wall',  wallBody),
-    pat('t-floor', floorBody),
-    pat('t-corr',  corrBody),
-    pat('t-water', waterBody),
-    pat('t-stair', stairBody),
-    pat('t-item',  itemBody),
-    pat('t-trap',  trapBody),
+    pat('t-wall', wallBody), pat('t-floor', floorBody), pat('t-corr', corrBody),
+    pat('t-water', waterBody), pat('t-stair', stairBody),
+    pat('t-item', itemBody), pat('t-trap', trapBody),
   ].join('\n  ');
 }
 
 const T_FILL = {
-  [T.WALL]:  'url(#t-wall)',
-  [T.FLOOR]: 'url(#t-floor)',
-  [T.CORR]:  'url(#t-corr)',
-  [T.WATER]: 'url(#t-water)',
-  [T.STAIR]: 'url(#t-stair)',
-  [T.ITEM]:  'url(#t-item)',
-  [T.TRAP]:  'url(#t-trap)',
+  [T.WALL]: 'url(#t-wall)', [T.FLOOR]: 'url(#t-floor)', [T.CORR]: 'url(#t-corr)',
+  [T.WATER]: 'url(#t-water)', [T.STAIR]: 'url(#t-stair)',
+  [T.ITEM]: 'url(#t-item)', [T.TRAP]: 'url(#t-trap)',
 };
 
-// ─── Dungeon → SVG rects ──────────────────────────────────────────────────────
+// ─── Dungeon → SVG rects with PMD depth shading ───────────────────────────────
 function dungeonToSVG(grid, W, H, ts) {
-  const rows  = [];
+  const rects = [];
   for (let y = 0; y < H; y++) {
     let run = null;
     for (let x = 0; x < W; x++) {
@@ -283,42 +252,45 @@ function dungeonToSVG(grid, W, H, ts) {
       if (run && run.fill === fill) {
         run.w += ts;
       } else {
-        if (run) rows.push(run);
+        if (run) rects.push(run);
         run = { fill, x: x * ts, y: y * ts, w: ts, h: ts };
       }
     }
-    if (run) rows.push(run);
+    if (run) rects.push(run);
   }
 
-  // Wall-shadow stripes: thin dark bar below each floor→wall transition
-  const shadows = [];
-  for (let y = 0; y < H - 1; y++) {
+  // Depth shading at floor/corridor → wall transitions
+  const depth = [];
+  for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
-      const cur  = grid[y][x];
-      const below = grid[y + 1][x];
-      if ((cur === T.FLOOR || cur === T.CORR) && below === T.WALL) {
-        shadows.push(
-          `<rect x="${x * ts}" y="${(y + 1) * ts}" width="${ts}" height="3" fill="rgba(0,0,0,0.4)"/>`
-        );
+      const c = grid[y][x];
+      const isOpen = c !== T.WALL;
+      // Shadow bar below open tile when wall is beneath (floor appears elevated)
+      if (isOpen && y + 1 < H && grid[y + 1][x] === T.WALL) {
+        depth.push(`<rect x="${x * ts}" y="${(y + 1) * ts}" width="${ts}" height="4" fill="rgba(0,0,0,0.55)"/>`);
+      }
+      // Wall front-face: lighter top edge on walls directly below open tiles
+      if (c === T.WALL && y > 0 && grid[y - 1][x] !== T.WALL) {
+        depth.push(`<rect x="${x * ts}" y="${y * ts}" width="${ts}" height="3" fill="#3A2860"/>`);
       }
     }
   }
 
-  return rows
+  return rects
     .map(r => `<rect x="${r.x}" y="${r.y}" width="${r.w + 0.5}" height="${r.h + 0.5}" fill="${r.fill}"/>`)
-    .join('\n') + '\n' + shadows.join('\n');
+    .join('\n') + '\n' + depth.join('\n');
 }
 
-// ─── Water shimmer animation ──────────────────────────────────────────────────
+// ─── Water shimmer FX ─────────────────────────────────────────────────────────
 function waterAnimSVG(grid, W, H, ts) {
   const lines = [];
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       if (grid[y][x] !== T.WATER) continue;
-      const delay = ((x * 3 + y * 7) % 17) * 0.15;
-      const cy    = fmt1((y + 0.45) * ts);
+      const delay = ((x * 3 + y * 7) % 17) * 0.14;
+      const cy = ((y + 0.44) * ts).toFixed(1);
       lines.push(
-        `<line x1="${fmt1((x + 0.15) * ts)}" y1="${cy}" x2="${fmt1((x + 0.85) * ts)}" y2="${cy}" ` +
+        `<line x1="${((x + 0.15) * ts).toFixed(1)}" y1="${cy}" x2="${((x + 0.85) * ts).toFixed(1)}" y2="${cy}" ` +
         `stroke="white" stroke-width="0.8" class="shimmer" style="animation-delay:${delay.toFixed(2)}s"/>`
       );
     }
@@ -326,290 +298,245 @@ function waterAnimSVG(grid, W, H, ts) {
   return lines.join('\n');
 }
 
-// ─── Pick room-to-room path ───────────────────────────────────────────────────
-function generateRoomPath(rooms, count = 3) {
+// ─── Build tile-by-tile pokemon animation ─────────────────────────────────────
+// Key fix: each tile step = durSec/frameCount (one walk frame per step, like real PMD)
+function buildPokemonSVG(idx, def, rooms, grid, W, H, delaySec, spriteInfo) {
+  if (!spriteInfo) return { defs: '', svg: '' };
+
+  // Pick 2–3 distinct room waypoints via RNG
   const chosen = [];
   const used   = new Set();
-  for (let attempt = 0; attempt < 200 && chosen.length < count; attempt++) {
-    const idx = ri(0, rooms.length);
-    if (!used.has(idx)) { used.add(idx); chosen.push(rooms[idx]); }
+  for (let a = 0; a < 300 && chosen.length < 3; a++) {
+    const i = ri(0, rooms.length);
+    if (!used.has(i)) { used.add(i); chosen.push(rooms[i]); }
   }
-  return chosen.map(r => ({
-    x: clamp((r.cx + 0.5) * TS, 0, SVG_W),
-    y: clamp((r.cy + 0.5) * TS, PLAY_Y + 4, PLAY_Y + PLAY_H - 4),
-  }));
-}
 
-// ─── Pokemon sprite element using <animateTransform> ─────────────────────────
-function buildPokemonSVG(idx, def, pts, totalDurSec, delaySec, spriteInfo) {
-  if (!pts || pts.length < 2) return { defs: '', svg: '' };
-
-  // Build round-trip waypoints: forward + backward
-  const fwd = pts;
-  const bwd = [...pts].reverse();
-  const full = [...fwd, ...bwd];       // length = 2*n, last point = first point repeated after
-
-  // Compute per-segment distances for distance-proportional keyTimes
-  const segs = [];
-  for (let i = 0; i < full.length - 1; i++) {
-    const dx = full[i + 1].x - full[i].x;
-    const dy = full[i + 1].y - full[i].y;
-    segs.push(Math.hypot(dx, dy) + 0.01);  // +0.01 avoids zero-distance stalls
+  // BFS stitch between consecutive waypoints
+  let onewayPath = [];
+  for (let i = 0; i < chosen.length - 1; i++) {
+    const a = chosen[i], b = chosen[i + 1];
+    const seg = bfsPath(grid, W, H, a.cx, a.cy, b.cx, b.cy);
+    if (i > 0 && onewayPath.length > 0) seg.shift(); // no duplicate junction tile
+    onewayPath = onewayPath.concat(seg);
   }
-  const totalDist = segs.reduce((a, b) => a + b, 0);
-  const kts = [0];
-  let cumulative = 0;
-  for (const d of segs) {
-    cumulative += d;
-    kts.push(cumulative / totalDist);
+  if (onewayPath.length < 2) onewayPath = [{ x: chosen[0].cx, y: chosen[0].cy }, { x: chosen[0].cx + 1, y: chosen[0].cy }];
+
+  // Cap one-way path at 35 tiles so total cycle ≤ ~70 steps
+  if (onewayPath.length > 35) onewayPath = onewayPath.slice(0, 35);
+
+  // Round-trip: forward → backward (omit duplicate endpoint)
+  const backward = [...onewayPath].reverse().slice(1);
+  const fullPath  = [...onewayPath, ...backward];
+  const N         = fullPath.length;
+
+  const { walkUri, idleUri, sheetW, sheetH, frameW, frameH, frameCount, durSec,
+          idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec } = spriteInfo;
+
+  // ── PMD-authentic timing: one walk FRAME per tile step ───────────────────────
+  // So the sprite advances by exactly one frame every time it moves one tile.
+  const SC       = 1;            // natural sprite size (no upscaling)
+  const stepDur  = durSec / frameCount;   // one frame duration
+  const totalDur = N * stepDur;           // full loop duration
+
+  // Evenly spaced keyTimes (equal time per tile step)
+  const kts   = Array.from({ length: N + 1 }, (_, i) => (i / N).toFixed(5));
+  const ktStr = kts.join(';');
+
+  // animateTransform values: SVG pixel center of each tile, closed loop
+  const translates = [
+    ...fullPath.map(t => `${(t.x * TS + TS / 2).toFixed(1)},${(t.y * TS + TS / 2).toFixed(1)}`),
+    `${(fullPath[0].x * TS + TS / 2).toFixed(1)},${(fullPath[0].y * TS + TS / 2).toFixed(1)}`,
+  ].join(';');
+
+  const dfw = frameW * SC, dfh = frameH * SC;
+  const hw  = dfw >> 1, hh = dfh >> 1;
+
+  // Walk x-animation: cycles all frames at walk speed (matches one step per frame)
+  const xVals = Array.from({ length: frameCount }, (_, f) => -(hw + f * dfw)).join(';');
+
+  // Direction y-values for each keyframe (which row of sprite sheet to show)
+  // Computed from direction of travel at that tile step
+  const dirYVals = fullPath.map((t, i) => {
+    const next = fullPath[i + 1] ?? fullPath[0]; // wrap around for last tile
+    return -(hh + dirRow(next.x - t.x, next.y - t.y) * dfh);
+  });
+  dirYVals.push(dirYVals[0]); // closing entry
+
+  const shadowY  = (hh * 0.40).toFixed(1);
+  const shadowRx = (dfw * 0.38).toFixed(1);
+  const shadowRy = (dfw * 0.09).toFixed(1);
+  const nameY    = (hh * 0.62).toFixed(1);
+
+  const clipId  = `clip${idx}`;
+  const iClipId = `iclip${idx}`;
+
+  // Clip path defs
+  let defsStr = `<clipPath id="${clipId}"><rect x="${-hw}" y="${-hh}" width="${dfw}" height="${dfh}"/></clipPath>`;
+  if (idleUri) {
+    const ifw = (idleFrameW || frameW) * SC, ifh = (idleFrameH || frameH) * SC;
+    defsStr += `\n  <clipPath id="${iClipId}"><rect x="${-(ifw >> 1)}" y="${-(ifh >> 1)}" width="${ifw}" height="${ifh}"/></clipPath>`;
   }
-  kts[kts.length - 1] = 1;  // clamp
-  const ktStr = kts.map(v => v.toFixed(4)).join(';');
 
-  // animateTransform values (closing the loop back to start)
-  const translates = [...full, full[0]].map(p => `${fmt1(p.x)},${fmt1(p.y)}`).join(';');
+  // Walk image — visible during walk (0–50% and 75–100%), hidden during idle (50–75%)
+  const walkDisplay = idleUri
+    ? `\n      <animate attributeName="display" values="inline;inline;none;inline" keyTimes="0;0.5;0.75;1" ` +
+      `dur="${totalDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>`
+    : '';
 
-  // Direction row at each keyframe (based on motion direction for that segment)
-  let defsStr = '';
-  let bodyStr = '';
-
-  if (spriteInfo) {
-    const { walkUri, idleUri,
-            sheetW, sheetH, frameW, frameH, frameCount, durSec,
-            idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec } = spriteInfo;
-
-    const SC   = 2;
-    const dfw  = frameW * SC;
-    const dfh  = frameH * SC;
-    const hw   = dfw / 2;
-    const hh   = dfh / 2;
-
-    const clipId  = `clip${idx}`;
-    const iClipId = `iclip${idx}`;
-
-    defsStr = `<clipPath id="${clipId}"><rect x="${-hw}" y="${-hh}" width="${dfw}" height="${dfh}"/></clipPath>`;
-    if (idleUri) {
-      const ifw = idleFrameW * SC, ifh = idleFrameH * SC;
-      defsStr += `\n  <clipPath id="${iClipId}"><rect x="${-(ifw/2)}" y="${-(ifh/2)}" width="${ifw}" height="${ifh}"/></clipPath>`;
-    }
-
-    // Walk frame x-animation
-    const xVals = Array.from({ length: frameCount }, (_, f) => -hw - f * dfw).join(';');
-
-    // Direction y-values at each keyframe
-    // full has n+1 points for n+1 keyTimes (the last kts=1 closes loop)
-    const dirYVals = [];
-    for (let i = 0; i < full.length; i++) {
-      let dx = 0, dy = 0;
-      if (i < full.length - 1) {
-        dx = full[i + 1].x - full[i].x;
-        dy = full[i + 1].y - full[i].y;
-      } else {
-        dx = full[1].x - full[0].x;  // loop back direction
-        dy = full[1].y - full[0].y;
-      }
-      const row = dirRow(dx, dy);
-      dirYVals.push(-hh - row * dfh);
-    }
-    // closing value = same as first
-    dirYVals.push(dirYVals[0]);
-    const dirYStr = dirYVals.join(';');
-    // keyTimes for direction: same as kts, plus closing 1
-    const dirKtStr = kts.join(';') + ';1';
-
-    const shadowY  = fmt1(hh * 0.35);
-    const shadowRx = fmt1(dfw * 0.36);
-    const shadowRy = fmt1(dfw * 0.07);
-    const nameY    = fmt1(hh * 0.55);
-
-    // Walk image
-    let walkImg = `<image href="${walkUri}"
-        x="${-hw}" y="${-hh}"
-        width="${sheetW * SC}" height="${sheetH * SC}"
-        image-rendering="pixelated"
-        clip-path="url(#${clipId})">
-      <animate attributeName="x" values="${xVals}" dur="${durSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
-      <animate attributeName="y" values="${dirYStr}" keyTimes="${dirKtStr}" dur="${totalDurSec.toFixed(2)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>`;
-
-    // Idle toggle: show idle at 75-100% of each cycle, hide walk at that point
-    if (idleUri) {
-      walkImg += `
-      <animate attributeName="display" values="inline;inline;none;inline" keyTimes="0;0.5;0.75;1" dur="${totalDurSec.toFixed(2)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>`;
-    }
-    walkImg += `\n    </image>`;
-
-    let idleImg = '';
-    if (idleUri) {
-      const ifw = idleFrameW * SC, ifh = idleFrameH * SC;
-      const ixVals = Array.from({ length: idleFrameCount }, (_, f) => -(ifw / 2) - f * ifw).join(';');
-      // idle row = idle direction = same dirRow at 75% mark → use row 0 (south/idle)
-      const idleRow = 0;
-      idleImg = `
-    <image href="${idleUri}"
-        x="${-(ifw/2)}" y="${-(ifh/2) - idleRow * ifh}"
-        width="${idleSheetW * SC}" height="${idleSheetH * SC}"
-        image-rendering="pixelated"
-        clip-path="url(#${iClipId})">
-      <animate attributeName="x" values="${ixVals}" dur="${idleDurSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
-      <animate attributeName="display" values="none;none;inline;none" keyTimes="0;0.5;0.75;1" dur="${totalDurSec.toFixed(2)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+  const walkImg = `<image href="${walkUri}"
+        x="${-hw}" y="${-hh}" width="${sheetW * SC}" height="${sheetH * SC}"
+        image-rendering="pixelated" clip-path="url(#${clipId})">
+      <animate attributeName="x" values="${xVals}"
+        dur="${durSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
+        calcMode="discrete" repeatCount="indefinite"/>
+      <animate attributeName="y" values="${dirYVals.join(';')}" keyTimes="${ktStr}"
+        dur="${totalDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
+        calcMode="discrete" repeatCount="indefinite"/>${walkDisplay}
     </image>`;
-    }
 
-    bodyStr = `
-  <g id="pkmn${idx}">
+  // Idle image — shown at 50–75% turnaround point
+  let idleImg = '';
+  if (idleUri) {
+    const ifw = (idleFrameW || frameW) * SC, ifh = (idleFrameH || frameH) * SC;
+    const ihw = ifw >> 1, ihh = ifh >> 1;
+    const ixVals = Array.from({ length: idleFrameCount }, (_, f) => -(ihw + f * ifw)).join(';');
+    idleImg = `
+    <image href="${idleUri}"
+        x="${-ihw}" y="${-ihh}" width="${(idleSheetW || sheetW) * SC}" height="${(idleSheetH || sheetH) * SC}"
+        image-rendering="pixelated" clip-path="url(#${iClipId})">
+      <animate attributeName="x" values="${ixVals}"
+        dur="${(idleDurSec || durSec).toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
+        calcMode="discrete" repeatCount="indefinite"/>
+      <animate attributeName="display" values="none;none;inline;none" keyTimes="0;0.5;0.75;1"
+        dur="${totalDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
+        calcMode="discrete" repeatCount="indefinite"/>
+    </image>`;
+  }
+
+  const svg = `
+  <g id="pk${idx}">
     <animateTransform attributeName="transform" type="translate"
-      values="${translates}" keyTimes="${ktStr};1"
-      dur="${totalDurSec.toFixed(2)}s" begin="${delaySec.toFixed(2)}s"
+      values="${translates}" keyTimes="${ktStr}"
+      dur="${totalDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
       calcMode="linear" repeatCount="indefinite" additive="replace"/>
-    <ellipse cx="0" cy="${shadowY}" rx="${shadowRx}" ry="${shadowRy}" fill="rgba(0,0,0,0.45)"/>
+    <ellipse cx="0" cy="${shadowY}" rx="${shadowRx}" ry="${shadowRy}" fill="rgba(0,0,0,0.55)"/>
     ${walkImg}${idleImg}
     <text y="${nameY}" text-anchor="middle"
-      font-family="'Courier New',Courier,monospace" font-size="7"
+      font-family="'Courier New',monospace" font-size="7"
       fill="white" stroke="black" stroke-width="2" paint-order="stroke">${def.name}</text>
   </g>`;
 
-  } else {
-    // Fallback diamond shape
-    const r       = 14;
-    const diamond = `0,${-r} ${r*0.7},0 0,${r} ${-r*0.7},0`;
-    bodyStr = `
-  <g id="pkmn${idx}">
-    <animateTransform attributeName="transform" type="translate"
-      values="${translates}" keyTimes="${ktStr};1"
-      dur="${totalDurSec.toFixed(2)}s" begin="${delaySec.toFixed(2)}s"
-      calcMode="linear" repeatCount="indefinite" additive="replace"/>
-    <ellipse cx="0" cy="${r*0.9}" rx="8" ry="3" fill="rgba(0,0,0,0.45)"/>
-    <polygon points="${diamond}" fill="${def.color}" stroke="${def.secondaryColor ?? '#fff'}" stroke-width="1.5"/>
-    <text y="${r + 12}" text-anchor="middle"
-      font-family="'Courier New',Courier,monospace" font-size="7"
-      fill="white" stroke="black" stroke-width="2" paint-order="stroke">${def.name}</text>
-  </g>`;
-  }
-
-  return { defs: defsStr, svg: bodyStr };
+  return { defs: defsStr, svg };
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   console.log('Generating PMD dungeon SVG …');
 
-  // Load sprites
+  // Load all sprites
   const spriteInfos = POKEMON.map(def => {
-    const localPath = (def.animations.walk ?? '').replace(/^\.\//, '');
-    if (!localPath || !existsSync(localPath)) {
-      console.warn(`  ⚠ Walk sprite not found: ${localPath}`);
-      return null;
-    }
-    const walkUri = `data:image/png;base64,${readFileSync(localPath).toString('base64')}`;
-    const { w: sheetW, h: sheetH } = pngSize(localPath);
-    const anim = parseAnim(localPath, 'Walk');
-    if (!anim) { console.warn(`  ⚠ No Walk AnimData for ${def.name}`); return null; }
-    const { frameW, frameH, frameCount, durSec } = anim;
-    console.log(`  ✓ ${def.name}: Walk ${frameW}×${frameH} ${frameCount}f ${durSec.toFixed(3)}s`);
+    const wp = (def.animations.walk ?? '').replace(/^\.\//, '');
+    if (!wp || !existsSync(wp)) { console.warn(`  ⚠ Walk not found: ${wp}`); return null; }
+    const anim = parseAnim(wp, 'Walk');
+    if (!anim) { console.warn(`  ⚠ No Walk AnimData: ${def.name}`); return null; }
+    const { w: sW, h: sH } = pngSize(wp);
+    const walkUri = `data:image/png;base64,${readFileSync(wp).toString('base64')}`;
+    console.log(`  ✓ ${def.name} Walk ${anim.frameW}×${anim.frameH} ${anim.frameCount}f ${anim.durSec.toFixed(3)}s  stepDur=${(anim.durSec/anim.frameCount).toFixed(3)}s`);
 
+    const ip = (def.animations.idle ?? '').replace(/^\.\//, '');
     let idleUri = null, idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec;
-    const idlePath = (def.animations.idle ?? '').replace(/^\.\//, '');
-    if (idlePath && existsSync(idlePath)) {
-      const ia = parseAnim(idlePath, 'Idle');
+    if (ip && existsSync(ip)) {
+      const ia = parseAnim(ip, 'Idle');
       if (ia) {
-        idleUri    = `data:image/png;base64,${readFileSync(idlePath).toString('base64')}`;
-        const { w: iW, h: iH } = pngSize(idlePath);
+        const { w: iW, h: iH } = pngSize(ip);
+        idleUri = `data:image/png;base64,${readFileSync(ip).toString('base64')}`;
         idleSheetW = iW; idleSheetH = iH;
         idleFrameW = ia.frameW; idleFrameH = ia.frameH;
         idleFrameCount = ia.frameCount; idleDurSec = ia.durSec;
-        console.log(`    idle: ${idleFrameW}×${idleFrameH} ${idleFrameCount}f ${idleDurSec.toFixed(3)}s`);
+        console.log(`    idle ${ia.frameW}×${ia.frameH} ${ia.frameCount}f`);
       }
     }
-    return { walkUri, idleUri, sheetW, sheetH, frameW, frameH, frameCount, durSec,
+    return { walkUri, idleUri, sheetW: sW, sheetH: sH, ...anim,
              idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec };
   });
 
   // Generate dungeon
-  const { grid, rooms, floorCells, W, H } = generateDungeon();
-  console.log(`  Dungeon: ${rooms.length} rooms, ${floorCells.length} floor cells`);
+  const { grid, rooms, W, H } = generateDungeon();
+  console.log(`  Dungeon: ${rooms.length} rooms`);
 
-  // Paths + timing
-  const paths  = POKEMON.map(() => generateRoomPath(rooms, 3 + ri(0, 2)));
-  const durs   = POKEMON.map(() => rf(18, 28));
-  const delays = POKEMON.map((_, i) => rf(0, 6) + i * 0.9);
-
-  // Build pokemon SVGs
+  // Build one pokemon per entry, staggered start
+  const delays  = POKEMON.map((_, i) => rf(0.5, 3) + i * 1.5);
   const pkParts = POKEMON.map((def, i) =>
-    buildPokemonSVG(i, def, paths[i], durs[i], delays[i], spriteInfos[i])
+    buildPokemonSVG(i, def, rooms, grid, W, H, delays[i], spriteInfos[i])
   );
   const pkDefs = pkParts.map(p => p.defs).filter(Boolean).join('\n  ');
   const pkSVGs = pkParts.map(p => p.svg).join('\n');
 
-  // Tile patterns + dungeon
   const tilePatterns = buildTilePatterns(TS);
   const dungeonSVG   = dungeonToSVG(grid, W, H, TS);
   const waterFX      = waterAnimSVG(grid, W, H, TS);
 
-  // Legend
-  const legY = SVG_H - LEG_H + 4;
-  const legendItems = POKEMON.map((def, i) => {
-    const lx = 10 + i * Math.floor(SVG_W / POKEMON.length);
-    return [
-      `<circle cx="${lx + 4}" cy="${legY + 4}" r="4" fill="${def.color}"/>`,
-      `<text x="${lx + 11}" y="${legY + 8}" font-family="'Courier New',monospace" font-size="7" fill="#ccc">${def.name}</text>`,
-    ].join('');
+  // Legend bar
+  const legY = SVG_H - LEG_H;
+  const legend = POKEMON.map((def, i) => {
+    const lx = 10 + i * Math.floor((SVG_W - 20) / POKEMON.length);
+    return `<circle cx="${lx + 4}" cy="${legY + 11}" r="4" fill="${def.color}"/>` +
+           `<text x="${lx + 11}" y="${legY + 15}" font-family="'Courier New',monospace" font-size="7" fill="#ccc">${def.name}</text>`;
   }).join('');
 
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
      width="${SVG_W}" height="${SVG_H}" viewBox="0 0 ${SVG_W} ${SVG_H}">
 <style>
-@keyframes shimmer{0%,100%{opacity:.1}50%{opacity:.3}}
-.shimmer{animation:shimmer 2.4s ease-in-out infinite}
+@keyframes shimmer{0%,100%{opacity:.08}50%{opacity:.32}}
+.shimmer{animation:shimmer 2.2s ease-in-out infinite}
 </style>
 <defs>
   <radialGradient id="vignette" cx="50%" cy="50%" r="70%">
     <stop offset="0%"   stop-color="transparent"/>
-    <stop offset="100%" stop-color="rgba(0,0,10,0.55)"/>
+    <stop offset="100%" stop-color="rgba(0,0,12,0.60)"/>
   </radialGradient>
-  <linearGradient id="titlebar" x1="0" x2="1" y1="0" y2="0">
-    <stop offset="0%"   stop-color="#0a1428"/>
-    <stop offset="50%"  stop-color="#12204a"/>
-    <stop offset="100%" stop-color="#0a1428"/>
+  <linearGradient id="titlegrad" x1="0" x2="1">
+    <stop offset="0%"   stop-color="#09091C"/>
+    <stop offset="50%"  stop-color="#101840"/>
+    <stop offset="100%" stop-color="#09091C"/>
   </linearGradient>
   ${tilePatterns}
   ${pkDefs}
 </defs>
 
-<!-- background -->
-<rect width="${SVG_W}" height="${SVG_H}" fill="#0D0D1A"/>
+<!-- background – same wall colour so edge tiles blend -->
+<rect width="${SVG_W}" height="${SVG_H}" fill="#1E1533"/>
 
 <!-- dungeon tilemap -->
 <g id="dungeon">${dungeonSVG}</g>
 
-<!-- water shimmer -->
-<g id="water-fx" opacity="0.7">${waterFX}</g>
+<!-- water shimmer lines -->
+<g id="wfx" opacity="0.7">${waterFX}</g>
 
-<!-- pokemon -->
+<!-- pokemon NPCs -->
 <g id="npcs">${pkSVGs}</g>
 
-<!-- vignette overlay -->
+<!-- vignette -->
 <rect width="${SVG_W}" height="${SVG_H}" fill="url(#vignette)"/>
 
 <!-- title bar -->
-<rect x="0" y="0" width="${SVG_W}" height="${TITLE_H}" fill="url(#titlebar)" opacity="0.94"/>
+<rect x="0" y="0" width="${SVG_W}" height="${TITLE_H}" fill="url(#titlegrad)" opacity="0.95"/>
 <text x="${SVG_W / 2}" y="18" text-anchor="middle"
   font-family="'Courier New',Courier,monospace" font-size="11" font-weight="bold"
-  fill="#88ddff" letter-spacing="2">&#9670; POKEMON MYSTERY DUNGEON WORLD &#9670;</text>
-<line x1="0" y1="${TITLE_H}" x2="${SVG_W}" y2="${TITLE_H}" stroke="#1a3060" stroke-width="1"/>
+  fill="#88DDFF" letter-spacing="2">&#9670; POKEMON MYSTERY DUNGEON WORLD &#9670;</text>
+<line x1="0" y1="${TITLE_H}" x2="${SVG_W}" y2="${TITLE_H}" stroke="#1A3060" stroke-width="1"/>
 
 <!-- legend -->
-<rect x="0" y="${SVG_H - LEG_H}" width="${SVG_W}" height="${LEG_H}" fill="rgba(0,0,0,0.65)"/>
-${legendItems}
+<rect x="0" y="${legY}" width="${SVG_W}" height="${LEG_H}" fill="rgba(0,0,0,0.72)"/>
+${legend}
 
 </svg>
 `;
 
   mkdirSync('assets', { recursive: true });
-  const outPath = 'assets/pokemon-world.svg';
-  const { writeFileSync } = await import('fs');
-  writeFileSync(outPath, svg, 'utf8');
-  console.log(`✅  Written ${outPath}  (${(svg.length / 1024).toFixed(0)} KB)`);
+  writeFileSync('assets/pokemon-world.svg', svg, 'utf8');
+  console.log(`\u2705  Written assets/pokemon-world.svg  (${(svg.length / 1024).toFixed(0)} KB)`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
