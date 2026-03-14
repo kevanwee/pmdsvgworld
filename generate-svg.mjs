@@ -7,6 +7,7 @@
 // CSS @keyframes provide smooth movement and idle bob animations.
 
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
+import { dirname, join } from 'path';
 import { TileMap } from './src/tilemap.js';
 import { TILE, TILE_COLOR, TILE_SIZE, MAP_W, MAP_H, CANVAS_W, CANVAS_H, POKEMON_DEFS } from './src/config.js';
 
@@ -16,28 +17,29 @@ function pngSize(filePath) {
   return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
 }
 
-function toDataUri(localUrl) {
-  // localUrl is like ./assets/sprites/0658/0000/0001/Walk-Anim.png
-  const path = localUrl.replace(/^\.\//, '');
-  if (!existsSync(path)) return null;
-  return `data:image/png;base64,${readFileSync(path).toString('base64')}`;
-}
-// Pick the frame width (fw) and frame count (fc) from the sprite sheet width.
-// Tries standard frame counts; picks the one whose fw is closest to hintFw.
-function detectFrameLayout(sheetW, hintFw) {
-  const candidates = [3, 4, 6, 8, 10, 12, 16];
-  let best = null;
-  for (const fc of candidates) {
-    if (sheetW % fc !== 0) continue;
-    const fw = sheetW / fc;
-    if (fw < 16) continue;
-    const dist = Math.abs(fw - hintFw);
-    if (!best || dist < best.dist) best = { fw, fc, dist };
+// Walk up from the sprite PNG's directory to find AnimData.xml, parse Walk dims.
+function parseAnimData(walkPngPath) {
+  let dir = dirname(walkPngPath);
+  for (let i = 0; i < 5; i++) {
+    const xmlPath = join(dir, 'AnimData.xml');
+    if (existsSync(xmlPath)) {
+      const xml = readFileSync(xmlPath, 'utf8');
+      const m = xml.match(/<Name>Walk<\/Name>[\s\S]*?<FrameWidth>(\d+)<\/FrameWidth>[\s\S]*?<FrameHeight>(\d+)<\/FrameHeight>[\s\S]*?<Durations>([\s\S]*?)<\/Durations>/);
+      if (m) {
+        const frameW = +m[1], frameH = +m[2];
+        const durs = [...m[3].matchAll(/<Duration>(\d+)<\/Duration>/g)];
+        const frameCount = durs.length;
+        const totalTicks = durs.reduce((s, d) => s + +d[1], 0);
+        return { frameW, frameH, frameCount, durSec: totalTicks / 60 };
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
-  if (best) return { fw: best.fw, fc: best.fc };
-  const fc = Math.max(1, Math.floor(sheetW / hintFw));
-  return { fw: hintFw, fc };
+  return null;
 }
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 const SEED     = 42;
 const SVG_W    = 960;
@@ -175,24 +177,32 @@ function pokemonSVG(idx, def, pts, dur, delay, spriteInfo) {
   let shadowY, shadowRx, shadowRy, nameY;
 
   if (spriteInfo) {
-    const { uri, sheetW, sheetH, actualFrameW, frameCount } = spriteInfo;
-    const fw  = actualFrameW;   // native px per frame
-    const fw2 = fw * 2;         // displayed px per frame (2x upscale)
+    const { uri, sheetW, sheetH, frameW, frameH, frameCount, durSec } = spriteInfo;
+    const SCALE = 2;
+    const dfw = frameW * SCALE;   // displayed frame width
+    const dfh = frameH * SCALE;   // displayed frame height
+    const halfW = dfw / 2;
+    const halfH = dfh / 2;
 
-    // Clip path: one displayed frame, centred at group origin
-    defsStr = `<clipPath id="${clipId}"><rect x="${-fw}" y="${-fw}" width="${fw2}" height="${fw2}"/></clipPath>`;
+    // Clip path: exact frame window centred at group origin
+    defsStr = `<clipPath id="${clipId}"><rect x="${-halfW}" y="${-halfH}" width="${dfw}" height="${dfh}"/></clipPath>`;
 
-    // Full sheet rendered at 2x; frame-0 / row-0 (south-facing) centred by positioning at (-fw,-fw)
+    // SMIL x values: shift image left by one displayed frame per step.
+    // Frame n is visible when image x = -halfW - n*dfw
+    const xVals = Array.from({length: frameCount}, (_, n) => -halfW - n * dfw).join(';');
+
     bodyStr = `<image href="${uri}"
-        x="${-fw}" y="${-fw}"
-        width="${sheetW * 2}" height="${sheetH * 2}"
-        clip-path="url(#${clipId})"
-        style="animation:sf${idx} 0.8s steps(${frameCount},end) ${delay.toFixed(2)}s infinite"/>`;
+        x="${-halfW}" y="${-halfH}"
+        width="${sheetW * SCALE}" height="${sheetH * SCALE}"
+        image-rendering="pixelated"
+        clip-path="url(#${clipId})">
+      <animate attributeName="x" values="${xVals}" dur="${durSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+    </image>`;
 
-    shadowY  = fmt1(fw * 1.1);
-    shadowRx = fmt1(fw * 0.55);
-    shadowRy = fmt1(fw * 0.12);
-    nameY    = fmt1(fw * 1.35);
+    shadowY  = fmt1(halfH + 2);
+    shadowRx = fmt1(dfw * 0.38);
+    shadowRy = fmt1(dfw * 0.07);
+    nameY    = fmt1(halfH + 11);
   } else {
     // Fallback: glowing diamond when sprite is unavailable
     const r       = Math.max(10, def.frameSize * SX * 0.7);
@@ -217,8 +227,7 @@ function pokemonSVG(idx, def, pts, dur, delay, spriteInfo) {
   </filter>
 
   <g style="animation:move${idx} ${dur.toFixed(1)}s ease-in-out ${delay.toFixed(2)}s infinite alternate;transform:translate(${fmt1(start.x)}px,${fmt1(start.y)}px)">
-    <ellipse cx="0" cy="${shadowY}" rx="${shadowRx}" ry="${shadowRy}" fill="rgba(0,0,0,0.35)"
-      style="animation:shadow${idx} ${(dur * 0.12).toFixed(1)}s ease-in-out infinite alternate"/>
+    <ellipse cx="0" cy="${shadowY}" rx="${shadowRx}" ry="${shadowRy}" fill="rgba(0,0,0,0.4)"/>
     <g style="animation:bob${idx} ${(1.8 + idx * 0.3).toFixed(1)}s ease-in-out ${delay.toFixed(2)}s infinite">
       ${bodyStr}
     </g>
@@ -243,9 +252,14 @@ async function main() {
     }
     const uri = `data:image/png;base64,${readFileSync(localPath).toString('base64')}`;
     const { w: sheetW, h: sheetH } = pngSize(localPath);
-    const { fw: actualFrameW, fc: frameCount } = detectFrameLayout(sheetW, def.frameSize);
-    console.log(`  ✓ ${def.name}: ${sheetW}x${sheetH} -> ${frameCount} frames x ${actualFrameW}px`);
-    return { uri, sheetW, sheetH, actualFrameW, frameCount };
+    const anim = parseAnimData(localPath);
+    if (!anim) {
+      console.warn(`  ⚠ No AnimData.xml for ${localPath}, skipping sprite`);
+      return null;
+    }
+    const { frameW, frameH, frameCount, durSec } = anim;
+    console.log(`  ✓ ${def.name}: ${frameW}x${frameH} ${frameCount}f ${(durSec).toFixed(3)}s (sheet ${sheetW}x${sheetH})`);
+    return { uri, sheetW, sheetH, frameW, frameH, frameCount, durSec };
   });
 
   const tileMap = new TileMap(SEED);
@@ -260,14 +274,6 @@ async function main() {
     pokemonCSS(i, paths[i], durs[i], delays[i])
   ).join('\n');
 
-  // Sprite-frame CSS: total travel = frameCount * actualFrameW * 2 (displayed at 2x scale)
-  const spriteFrameCSS = POKEMON.map((def, i) => {
-    if (!spriteInfos[i]) return `@keyframes sf${i}{}`;
-    const { actualFrameW, frameCount } = spriteInfos[i];
-    const totalPx = actualFrameW * frameCount * 2;
-    return `@keyframes sf${i}{from{transform:translateX(0)}to{transform:translateX(-${totalPx}px)}}`;
-  }).join('\n');
-
   // Water ripple animation
   const waterCSS = `
 @keyframes ripple{0%,100%{opacity:.12}50%{opacity:.22}}
@@ -275,7 +281,6 @@ async function main() {
 
   const css = `<style>
 ${pokemonCSStyles}
-${spriteFrameCSS}
 ${waterCSS}
 </style>`;
 
