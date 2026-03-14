@@ -1,11 +1,26 @@
 // ─── SpriteCollab URL builder ────────────────────────────────────────────────
-const SPRITE_BASE = 'https://raw.githubusercontent.com/PMDCollab/SpriteCollab/master/sprite';
+// Prefers locally-downloaded sprites (assets/sprites/…) when served from a
+// local dev server; falls back to the SpriteCollab GitHub raw URL for remote.
+const SPRITE_BASE_LOCAL  = './assets/sprites';
+const SPRITE_BASE_REMOTE = 'https://raw.githubusercontent.com/PMDCollab/SpriteCollab/master/sprite';
 
 function spriteUrl(id, animation, shiny = false, form = null) {
-  const formPath = form ? `/${form}` : '';
-  const shinyPath = shiny ? '/Shiny' : '';
-  return `${SPRITE_BASE}/${id}${formPath}${shinyPath}/${animation}-Anim.png`;
+  const formPath  = form  ? `/${form}`  : '';
+  const shinyPath = shiny ? '/Shiny'    : '';
+  const suffix    = `${formPath}${shinyPath}/${animation}-Anim.png`;
+  // Local path used when served via npm start; remote fallback otherwise.
+  return `${SPRITE_BASE_LOCAL}/${id}${suffix}`;
 }
+
+// Remote fallback (used by SVG generator which runs outside the server)
+export function remoteSpriteUrl(id, animation, shiny = false, form = null) {
+  const formPath  = form  ? `/${form}`  : '';
+  const shinyPath = shiny ? '/Shiny'    : '';
+  return `${SPRITE_BASE_REMOTE}/${id}${formPath}${shinyPath}/${animation}-Anim.png`;
+}
+
+export const PORTRAIT_BASE_LOCAL  = './assets/sprites';
+export const PORTRAIT_BASE_REMOTE = 'https://raw.githubusercontent.com/PMDCollab/SpriteCollab/master/portrait';
 
 // ─── Pokemon definitions ──────────────────────────────────────────────────────
 // form '0001' = first alternate form (Mega for Diancie)
@@ -133,39 +148,42 @@ export const WORLD_POKEMON = Object.values(POKEMON_DEFS);
 
 // ─── Tile types ───────────────────────────────────────────────────────────────
 export const TILE = {
-  DEEP_WATER: 0,
-  WATER:      1,
-  SAND:       2,
-  GRASS:      3,
-  TALL_GRASS: 4,
-  TREE:       5,
-  PATH:       6,
-  FLOWER_R:   7,
-  FLOWER_Y:   8,
+  DEEP_WATER:   0,
+  WATER:        1,
+  SAND:         2,
+  GRASS:        3,
+  TALL_GRASS:   4,
+  TREE:         5,
+  PATH:         6,
+  FLOWER_R:     7,
+  FLOWER_Y:     8,
+  STONE_CIRCLE: 9,
 };
 
 export const TILE_COLOR = {
-  [TILE.DEEP_WATER]: '#1565a0',
-  [TILE.WATER]:      '#2196d4',
-  [TILE.SAND]:       '#e8d09a',
-  [TILE.GRASS]:      '#4caf50',
-  [TILE.TALL_GRASS]: '#2e7d32',
-  [TILE.TREE]:       '#1b5e20',
-  [TILE.PATH]:       '#c8a870',
-  [TILE.FLOWER_R]:   '#4caf50',  // base grass color, flower drawn on top
-  [TILE.FLOWER_Y]:   '#4caf50',
+  [TILE.DEEP_WATER]:   '#1565a0',
+  [TILE.WATER]:        '#2196d4',
+  [TILE.SAND]:         '#e8d09a',
+  [TILE.GRASS]:        '#4caf50',
+  [TILE.TALL_GRASS]:   '#2e7d32',
+  [TILE.TREE]:         '#1b5e20',
+  [TILE.PATH]:         '#c8a870',
+  [TILE.FLOWER_R]:     '#4caf50',
+  [TILE.FLOWER_Y]:     '#4caf50',
+  [TILE.STONE_CIRCLE]: '#9890a0',
 };
 
 export const TILE_WALKABLE = {
-  [TILE.DEEP_WATER]: false,
-  [TILE.WATER]:      false,
-  [TILE.SAND]:       true,
-  [TILE.GRASS]:      true,
-  [TILE.TALL_GRASS]: true,
-  [TILE.TREE]:       false,
-  [TILE.PATH]:       true,
-  [TILE.FLOWER_R]:   true,
-  [TILE.FLOWER_Y]:   true,
+  [TILE.DEEP_WATER]:   false,
+  [TILE.WATER]:        false,
+  [TILE.SAND]:         true,
+  [TILE.GRASS]:        true,
+  [TILE.TALL_GRASS]:   true,
+  [TILE.TREE]:         false,
+  [TILE.PATH]:         true,
+  [TILE.FLOWER_R]:     true,
+  [TILE.FLOWER_Y]:     true,
+  [TILE.STONE_CIRCLE]: true,
 };
 
 // ─── PMD direction order (0=South, going clockwise) ──────────────────────────
@@ -181,11 +199,11 @@ export const DIR_W  = 6;
 export const DIR_SW = 7;
 
 // ─── World constants ──────────────────────────────────────────────────────────
-export const TILE_SIZE   = 16;
-export const MAP_W       = 64;
-export const MAP_H       = 40;
-export const CANVAS_W    = MAP_W * TILE_SIZE;  // 1024
-export const CANVAS_H    = MAP_H * TILE_SIZE;  // 640
+export const TILE_SIZE   = 24;                 // PMD GBA tile size
+export const MAP_W       = 48;
+export const MAP_H       = 32;
+export const CANVAS_W    = 960;
+export const CANVAS_H    = 600;
 export const SCALE       = 2;                  // render sprites at 2x
 export const FPS_TARGET  = 60;
 
