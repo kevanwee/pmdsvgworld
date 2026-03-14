@@ -1,6 +1,10 @@
 ﻿import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { dirname, join, basename } from 'path';
+import { get } from 'https';
 import { POKEMON_DEFS } from './src/config.js';
+
+// ─── Sprite scale (applied to all sprite images, not tile size) ───────────────
+const SPRITE_SCALE = 2;
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
 const SVG_W   = 960;
@@ -69,6 +73,26 @@ const rng = makeRng(SEED * 31337);
 const ri  = (lo, hi) => Math.floor(rng() * (hi - lo)) + lo;
 const f1  = n => n.toFixed(1);
 const f5  = n => n.toFixed(5);
+
+// ─── HTTP download ────────────────────────────────────────────────────────────
+function fetchBuffer(url) {
+  return new Promise((res, rej) => {
+    get(url, r => {
+      if (r.statusCode !== 200) return rej(new Error(`HTTP ${r.statusCode} ${url}`));
+      const chunks = [];
+      r.on('data', c => chunks.push(c));
+      r.on('end', () => res(Buffer.concat(chunks)));
+    }).on('error', rej);
+  });
+}
+
+// ─── Tileset SVG pattern (crops a 24×24 source tile, scaled to TS×TS) ────────
+function tilePattern(id, uri, srcX, srcY) {
+  const scale = TS / 24;
+  return `<pattern id="${id}" x="0" y="0" width="${TS}" height="${TS}" patternUnits="userSpaceOnUse">
+  <image href="${uri}" x="${-srcX * scale}" y="${-srcY * scale}" width="${432 * scale}" height="${192 * scale}" image-rendering="pixelated"/>
+</pattern>`;
+}
 
 // ─── Sprite helpers ───────────────────────────────────────────────────────────
 function pngSize(fp) {
@@ -216,31 +240,31 @@ function dijkstraPath(grid, W, H, sx, sy, ex, ey, avoidTiles, hardBlocks = new S
   return path.reverse();
 }
 
-// ─── Per-tile inline rendering (NO SVG pattern) ─────────────────────────────
-function renderTile(tx, ty, type) {
+// ─── Per-tile inline rendering ───────────────────────────────────────────────
+function renderTile(tx, ty, type, ts = false) {
   const r = (x, y, w, h, c, extra = '') =>
     `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${c}"${extra}/>`;
   switch (type) {
     case T.WALL:
       return r(tx, ty, TS, TS, C.bgDark) +
-             r(tx + 1, ty + 1, TS - 2, TS - 2, C.wallInner);
+             r(tx + 1, ty + 1, TS - 2, TS - 2, ts ? 'url(#patWall)' : C.wallInner);
 
     case T.FLOOR:
-      return r(tx,       ty,       TS,     TS,     C.floorGrout) +
-             r(tx + 1,   ty + 1,   TS - 2, TS - 2, C.floorFill)  +
+      return r(tx, ty, TS, TS, ts ? 'url(#patFloor)' : C.floorGrout) +
+             (ts ? '' : r(tx + 1, ty + 1, TS - 2, TS - 2, C.floorFill)) +
              r(tx + 1,   ty + 1,   TS - 2, 1,      C.floorHi)    +
              r(tx + 1,   ty + 1,   1,      TS - 3, C.floorHi)    +
              r(tx + 1,   ty+TS-2,  TS - 2, 1,      C.floorSh)    +
              r(tx+TS-2,  ty + 2,   1,      TS - 3, C.floorSh);
 
     case T.CORR:
-      return r(tx,     ty,     TS,     TS,     C.corrGrout) +
-             r(tx + 1, ty + 1, TS - 2, TS - 2, C.corrFill)  +
-             r(tx + 1, ty + 1, TS - 2, 1,      C.corrHi)    +
+      return r(tx, ty, TS, TS, ts ? 'url(#patCorr)' : C.corrGrout) +
+             (ts ? '' : r(tx + 1, ty + 1, TS - 2, TS - 2, C.corrFill)) +
+             r(tx + 1, ty + 1, TS - 2, 1, C.corrHi) +
              r(tx + 1, ty + 1, 1,      TS - 3, C.corrHi);
 
     case T.WATER:
-      return r(tx, ty, TS, TS, C.waterFill) +
+      return r(tx, ty, TS, TS, ts ? 'url(#patWater)' : C.waterFill) +
              r(tx, ty + Math.round(TS * 0.28), TS, 2, C.waterShine, ' opacity="0.6"') +
              r(tx, ty + Math.round(TS * 0.64), TS, 2, C.waterShine, ' opacity="0.6"');
 
@@ -267,11 +291,11 @@ function renderTile(tx, ty, type) {
   }
 }
 
-function dungeonToSVG(grid, W, H) {
+function dungeonToSVG(grid, W, H, ts = false) {
   const tiles = [];
   for (let y = 0; y < H; y++)
     for (let x = 0; x < W; x++)
-      tiles.push(renderTile(x * TS, y * TS, grid[y][x]));
+      tiles.push(renderTile(x * TS, y * TS, grid[y][x], ts));
 
   const depth = [];
   for (let y = 1; y < H; y++) for (let x = 0; x < W; x++) {
@@ -335,11 +359,11 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo) 
     slpUri,  slpSheetW,  slpSheetH,  slpFrameW,  slpFrameH,  slpFrameCount,  slpDurSec,
   } = spriteInfo;
 
+  const SS  = SPRITE_SCALE;
   const dfw = frameW, dfh = frameH;
   const hw  = dfw >> 1, hh = dfh >> 1;
 
   // ── Position keyTimes and values ─────────────────────────────────────────────
-  // forward walk (0..bs) + battle hold (bs..be) + backward walk (be..bkend) + sleep hold (bkend..1.0)
   const pathRev = [...path].reverse();
 
   const allKts = [
@@ -360,9 +384,9 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo) 
   const ktStr  = allKts.map(f5).join(';');
   const posStr = allPos.join(';');
 
-  // Walk direction Y-offset per keyframe
+  // Walk direction Y-offset per keyframe (scaled)
   const opponent = role === 'A' ? eB : eA;
-  const dirY = (from, to) => -(hh + dirRow(to.x - from.x, to.y - from.y) * dfh);
+  const dirY = (from, to) => -(hh + dirRow(to.x - from.x, to.y - from.y) * dfh) * SS;
   const allDirY = [
     ...Array.from({ length: WALK_TILES + 1 }, (_, i) => {
       const from = path[i], to = path[Math.min(i + 1, WALK_TILES)];
@@ -373,85 +397,80 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo) 
       const from = pathRev[i + 1], to = pathRev[Math.min(i + 2, WALK_TILES)];
       return dirY(from, to);
     }),
-    -hh,  // sleep: row 0
+    -hh * SS,  // sleep: row 0
   ];
 
   const clipId = `wc${pkIdx}`;
-  let defsStr = `<clipPath id="${clipId}"><rect x="${-hw}" y="${-hh}" width="${dfw}" height="${dfh}"/></clipPath>`;
+  let defsStr = `<clipPath id="${clipId}"><rect x="${-hw*SS}" y="${-hh*SS}" width="${dfw*SS}" height="${dfh*SS}"/></clipPath>`;
 
-  // ── Walk sprite — visible only during walking phases ─────────────────────────
-  const walkXVals = Array.from({ length: frameCount }, (_, f) => -(hw + f * dfw)).join(';');
+  // ── Walk sprite ───────────────────────────────────────────────────────────────
+  const walkXVals = Array.from({ length: frameCount }, (_, f) => -(hw + f * dfw) * SS).join(';');
   const walkImg = `<image id="w${pkIdx}" href="${walkUri}"
-      x="${-hw}" y="${-hh}" width="${sheetW}" height="${sheetH}" image-rendering="pixelated" clip-path="url(#${clipId})">
+      x="${-hw*SS}" y="${-hh*SS}" width="${sheetW*SS}" height="${sheetH*SS}" image-rendering="pixelated" clip-path="url(#${clipId})">
     <animate attributeName="x" values="${walkXVals}" dur="${durSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
     <animate attributeName="y" values="${allDirY.join(';')}" keyTimes="${ktStr}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
     <animate attributeName="display" values="inline;none;inline;none" keyTimes="0;${f5(bs)};${f5(be)};${f5(bkend)}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
 
-  // ── Strike sprite — 4-phase back-and-forth battle ────────────────────────────
+  // ── Strike / Hurt sprites ─────────────────────────────────────────────────────
   let strkImg = '', hrtImg = '', slpImg = '';
   if (strkUri && hrtUri) {
     const adfw = strkFrameW, adfh = strkFrameH;
     const ahw = adfw >> 1, ahh = adfh >> 1;
     const aClipId = `ac${pkIdx}`;
-    defsStr += `\n  <clipPath id="${aClipId}"><rect x="${-ahw}" y="${-ahh}" width="${adfw}" height="${adfh}"/></clipPath>`;
+    defsStr += `\n  <clipPath id="${aClipId}"><rect x="${-ahw*SS}" y="${-ahh*SS}" width="${adfw*SS}" height="${adfh*SS}"/></clipPath>`;
 
     const strkFaceDir = role === 'A'
       ? dirRow(eB.x - eA.x, eB.y - eA.y)
       : dirRow(eA.x - eB.x, eA.y - eB.y);
-    const strkY = -(ahh + strkFaceDir * adfh);
-    const strkXVals = Array.from({ length: strkFrameCount }, (_, f) => -(ahw + f * adfw)).join(';');
-
-    // A attacks phases 0 and 2 (p0e->p1e, p2e->p3e); B attacks phases 1 and 3 (p1e->p2e, p3e->p4e)
+    const strkY = -(ahh + strkFaceDir * adfh) * SS;
+    const strkXVals = Array.from({ length: strkFrameCount }, (_, f) => -(ahw + f * adfw) * SS).join(';');
     const strkKt = role === 'A'
       ? `0;${f5(p0e)};${f5(p1e)};${f5(p2e)};${f5(p3e)}`
       : `0;${f5(p1e)};${f5(p2e)};${f5(p3e)};${f5(p4e)}`;
 
     strkImg = `<image id="a${pkIdx}" href="${strkUri}"
-      x="${-ahw}" y="${strkY}" width="${strkSheetW}" height="${strkSheetH}" image-rendering="pixelated" clip-path="url(#${aClipId})">
+      x="${-ahw*SS}" y="${strkY}" width="${strkSheetW*SS}" height="${strkSheetH*SS}" image-rendering="pixelated" clip-path="url(#${aClipId})">
     <animate attributeName="x" values="${strkXVals}" dur="${strkDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
     <animate attributeName="display" values="none;inline;none;inline;none" keyTimes="${strkKt}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
 
-    // ── Hurt sprite ──────────────────────────────────────────────────────────────
     const hdfw = hrtFrameW, hdfh = hrtFrameH;
     const hhw = hdfw >> 1, hhh = hdfh >> 1;
     const hClipId = `hc${pkIdx}`;
-    defsStr += `\n  <clipPath id="${hClipId}"><rect x="${-hhw}" y="${-hhh}" width="${hdfw}" height="${hdfh}"/></clipPath>`;
+    defsStr += `\n  <clipPath id="${hClipId}"><rect x="${-hhw*SS}" y="${-hhh*SS}" width="${hdfw*SS}" height="${hdfh*SS}"/></clipPath>`;
 
     const hrtFaceDir = role === 'A'
       ? dirRow(eB.x - eA.x, eB.y - eA.y)
       : dirRow(eA.x - eB.x, eA.y - eB.y);
-    const hrtY = -(hhh + hrtFaceDir * hdfh);
-    const hrtXVals = Array.from({ length: hrtFrameCount }, (_, f) => -(hhw + f * hdfw)).join(';');
-
-    // A hurt in phases 1 & 3 (B attacks); B hurt in phases 0 & 2 (A attacks)
+    const hrtY = -(hhh + hrtFaceDir * hdfh) * SS;
+    const hrtXVals = Array.from({ length: hrtFrameCount }, (_, f) => -(hhw + f * hdfw) * SS).join(';');
     const hrtKt = role === 'A'
       ? `0;${f5(p1e)};${f5(p2e)};${f5(p3e)};${f5(p4e)}`
       : `0;${f5(p0e)};${f5(p1e)};${f5(p2e)};${f5(p3e)}`;
 
     hrtImg = `<image id="h${pkIdx}" href="${hrtUri}"
-      x="${-hhw}" y="${hrtY}" width="${hrtSheetW}" height="${hrtSheetH}" image-rendering="pixelated" clip-path="url(#${hClipId})">
+      x="${-hhw*SS}" y="${hrtY}" width="${hrtSheetW*SS}" height="${hrtSheetH*SS}" image-rendering="pixelated" clip-path="url(#${hClipId})">
     <animate attributeName="x" values="${hrtXVals}" dur="${hrtDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
     <animate attributeName="display" values="none;inline;none;inline;none" keyTimes="${hrtKt}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
   }
 
-  // ── Sleep sprite — shown during [bkend..1.0) at home position ─────────────────
+  // ── Sleep sprite ──────────────────────────────────────────────────────────────
   if (slpUri) {
     const sfW = slpFrameW, sfH = slpFrameH;
     const shw = sfW >> 1, shh = sfH >> 1;
     const slpClipId = `sc${pkIdx}`;
-    defsStr += `\n  <clipPath id="${slpClipId}"><rect x="${-shw}" y="${-shh}" width="${sfW}" height="${sfH}"/></clipPath>`;
-    const slpXVals = Array.from({ length: slpFrameCount }, (_, f) => -(shw + f * sfW)).join(';');
+    defsStr += `\n  <clipPath id="${slpClipId}"><rect x="${-shw*SS}" y="${-shh*SS}" width="${sfW*SS}" height="${sfH*SS}"/></clipPath>`;
+    const slpXVals = Array.from({ length: slpFrameCount }, (_, f) => -(shw + f * sfW) * SS).join(';');
     slpImg = `<image id="s${pkIdx}" href="${slpUri}"
-      x="${-shw}" y="${-shh}" width="${slpSheetW}" height="${slpSheetH}" image-rendering="pixelated" clip-path="url(#${slpClipId})">
+      x="${-shw*SS}" y="${-shh*SS}" width="${slpSheetW*SS}" height="${slpSheetH*SS}" image-rendering="pixelated" clip-path="url(#${slpClipId})">
     <animate attributeName="x" values="${slpXVals}" dur="${slpDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
     <animate attributeName="display" values="none;inline" keyTimes="0;${f5(bkend)}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
   }
 
-  // ── Hit-flash: two pulses per cycle (one each time this pokemon is hit) ───────
+  // ── Hit-flash ─────────────────────────────────────────────────────────────────
   const fd = 0.3 / PAIR_DUR;
   const flashKt = role === 'A'
     ? `0;${f5(p1e)};${f5(p1e+fd)};${f5(p2e)};${f5(p3e)};${f5(p3e+fd)};${f5(p4e)}`
@@ -460,9 +479,9 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo) 
     <animate attributeName="opacity" values="0;0;0.55;0;0;0.55;0" keyTimes="${flashKt}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>
   </circle>`;
 
-  const shadowY  = f1(hh * 0.42);
-  const shadowRx = f1(dfw * 0.36);
-  const shadowRy = f1(TS  * 0.12);
+  const shadowY  = f1(hh * SS * 0.42);
+  const shadowRx = f1(dfw * SS * 0.36);
+  const shadowRy = f1(TS * 0.12);
 
   const svg = `
   <g id="pk${pkIdx}">
@@ -524,6 +543,29 @@ async function main() {
     };
   });
 
+  // ── Download dungeon tileset from PMDCollab/RawAsset ─────────────────────────
+  // SealedRuin tileset: 432×192 (18×8 tiles), 3 sections of 6×8
+  // Section 0 (wall): x 0–143  | Section 1 (water): x 144–287 | Section 2 (floor): x 288–431
+  // Row 6 (y=144) = interior surrounded tiles — good default for inner floor/wall
+  const DUNGEON_NAME = 'SealedRuin';
+  const TILESET_URL  = `https://raw.githubusercontent.com/PMDCollab/RawAsset/master/TileDtef/${DUNGEON_NAME}/tileset_0.png`;
+  let tilesetUri = null;
+  try {
+    const buf = await fetchBuffer(TILESET_URL);
+    tilesetUri = `data:image/png;base64,${buf.toString('base64')}`;
+    console.log(`  Tileset loaded: ${DUNGEON_NAME} (${(buf.length/1024).toFixed(0)} KB)`);
+  } catch (e) {
+    console.warn(`  ! Tileset download failed (${e.message}), using solid colours`);
+  }
+
+  // Build pattern defs (one 24×24 crop per tile type, scaled to TS×TS)
+  const patternDefs = tilesetUri ? [
+    tilePattern('patFloor', tilesetUri, 384, 144),   // section 2, row 6, col 4 — inner floor
+    tilePattern('patWall',  tilesetUri,  96, 144),   // section 0, row 6, col 4 — inner wall
+    tilePattern('patCorr',  tilesetUri, 312, 120),   // section 2, row 5, col 1 — corridor
+    tilePattern('patWater', tilesetUri, 240, 144),   // section 1, row 6, col 4 — water
+  ].join('\n  ') : '';
+
   // Generate dungeon
   const { grid, rooms, W, H } = generateDungeon();
   console.log(`  Dungeon: ${rooms.length} rooms (${W}x${H} tiles)`);
@@ -545,13 +587,16 @@ async function main() {
     const delay = pairDelays[pairIdx];
     const idxA = pairIdx * 2, idxB = pairIdx * 2 + 1;
     console.log(`  Pair ${pairIdx}: ${POKEMON[idxA].name} (room ${ridxA}) <-> ${POKEMON[idxB].name} (room ${ridxB})`);
-    pkParts.push(buildPokemonSVG(idxA, POKEMON[idxA], pathA, eA, eB, 'A', delay, spriteInfos[idxA]));
-    pkParts.push(buildPokemonSVG(idxB, POKEMON[idxB], pathB, eA, eB, 'B', delay, spriteInfos[idxB]));
+    pkParts.push({ ...buildPokemonSVG(idxA, POKEMON[idxA], pathA, eA, eB, 'A', delay, spriteInfos[idxA]), homeY: pathA[0].y });
+    pkParts.push({ ...buildPokemonSVG(idxB, POKEMON[idxB], pathB, eA, eB, 'B', delay, spriteInfos[idxB]), homeY: pathB[0].y });
   }
+
+  // ── Y-sort: lower homeY (higher on screen) renders first → behind ─────────────
+  pkParts.sort((a, b) => a.homeY - b.homeY);
 
   const pkDefs = pkParts.map(p => p.defs).filter(Boolean).join('\n  ');
   const pkSVGs = pkParts.map(p => p.svg).join('\n');
-  const dungeonSVG = dungeonToSVG(grid, W, H);
+  const dungeonSVG = dungeonToSVG(grid, W, H, !!tilesetUri);
   const waterFX    = waterAnimSVG(grid, W, H);
 
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
@@ -566,6 +611,7 @@ async function main() {
     <stop offset="0%"   stop-color="transparent"/>
     <stop offset="100%" stop-color="rgba(0,0,14,0.62)"/>
   </radialGradient>
+  ${patternDefs}
   ${pkDefs}
 </defs>
 
