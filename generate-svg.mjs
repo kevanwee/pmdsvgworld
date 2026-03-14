@@ -686,8 +686,8 @@ async function main() {
     [1, 5],   // Ceruledge  vs Yveltal
     [3, 4],   // Greninja   vs Armarouge
   ];
-  // Delays spaced to avoid >1 pair sleeping simultaneously (≤2 pokemon sleeping)
-  const pairDelays = [0.5, 8.0, 16.0];
+  // All pairs start at t=0 — no staggered spawning
+  const pairDelays = [0, 0, 0];
 
   const pkParts = [];
   for (let pairIdx = 0; pairIdx < 3; pairIdx++) {
