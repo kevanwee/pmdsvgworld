@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Agent Visualizer – Pokemon Edition</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #050510;
+      color: #eee;
+      font-family: 'Press Start 2P', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 20px;
+      gap: 14px;
+    }
+
+    h1 {
+      font-size: 12px;
+      color: #00ffaa;
+      text-shadow: 0 0 12px #00ff88;
+      letter-spacing: 1px;
+      text-align: center;
+    }
+
+    .subtitle {
+      font-size: 6px;
+      color: #446;
+      text-align: center;
+      line-height: 2.2;
+    }
+
+    .layout {
+      display: flex;
+      gap: 16px;
+      width: 100%;
+      max-width: 1300px;
+      align-items: flex-start;
+    }
+
+    .canvas-wrapper {
+      position: relative;
+      border: 2px solid #1a3a2a;
+      border-radius: 4px;
+      box-shadow: 0 0 40px rgba(0,255,120,0.12), 0 0 80px rgba(0,100,50,0.1);
+      overflow: hidden;
+      flex: 1;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      image-rendering: pixelated;
+    }
+
+    .sidebar {
+      width: 280px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .panel {
+      background: #0d0d22;
+      border: 1px solid #1a2a3a;
+      border-radius: 4px;
+      padding: 12px;
+    }
+
+    .panel h2 {
+      font-size: 7px;
+      color: #00ffaa;
+      margin-bottom: 10px;
+      border-bottom: 1px solid #1a2a3a;
+      padding-bottom: 6px;
+    }
+
+    .log-feed {
+      height: 280px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .log-entry {
+      font-size: 6px;
+      color: #8ac;
+      line-height: 1.8;
+      border-bottom: 1px solid #111;
+      padding-bottom: 3px;
+    }
+
+    .dispatch-form {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .dispatch-form label {
+      font-size: 6px;
+      color: #668;
+    }
+
+    .dispatch-form select,
+    .dispatch-form input {
+      font-family: inherit;
+      font-size: 6px;
+      background: #0a0a20;
+      color: #aef;
+      border: 1px solid #224;
+      border-radius: 3px;
+      padding: 5px;
+      width: 100%;
+    }
+
+    .dispatch-form button,
+    .controls button {
+      font-family: inherit;
+      font-size: 7px;
+      background: #0a1a0a;
+      color: #00ffaa;
+      border: 1px solid #0a4a2a;
+      border-radius: 3px;
+      padding: 8px;
+      cursor: pointer;
+      width: 100%;
+      transition: background 0.15s;
+    }
+    .dispatch-form button:hover,
+    .controls button:hover {
+      background: #0a2a1a;
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      flex-direction: column;
+    }
+
+    .agent-status {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .agent-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 6px;
+    }
+
+    .agent-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .agent-name { color: #aaa; flex: 1; }
+    .agent-state { color: #668; }
+
+    .back-link {
+      font-size: 7px;
+      color: #88aaff;
+      text-decoration: none;
+      align-self: flex-start;
+    }
+    .back-link:hover { color: #aaccff; }
+
+    a { color: #00ffaa; font-size: 6px; }
+  </style>
+</head>
+<body>
+
+  <h1>◆ CLAUDE AGENT VISUALIZER ◆</h1>
+  <p class="subtitle">
+    pokemon represent claude agents · attack dummy = doing work<br>
+    agents meeting each other = agent interaction / battle
+  </p>
+
+  <a href="index.html" class="back-link">← Pokemon World</a>
+
+  <div class="layout">
+
+    <div class="canvas-wrapper">
+      <canvas id="agent-canvas"></canvas>
+    </div>
+
+    <div class="sidebar">
+
+      <!-- Agent status -->
+      <div class="panel">
+        <h2>⚡ AGENT STATUS</h2>
+        <div class="agent-status" id="agent-status"></div>
+      </div>
+
+      <!-- Dispatch work -->
+      <div class="panel">
+        <h2>📋 DISPATCH TASK</h2>
+        <div class="dispatch-form">
+          <label>Agent</label>
+          <select id="dispatch-agent">
+            <option value="-1">Random idle agent</option>
+          </select>
+
+          <label>Task</label>
+          <input type="text" id="dispatch-task" placeholder="e.g. Write code..." maxlength="30" />
+
+          <button id="btn-dispatch">⚡ Dispatch</button>
+          <button id="btn-dispatch-all">⚔ Dispatch to All</button>
+        </div>
+      </div>
+
+      <!-- Activity log -->
+      <div class="panel">
+        <h2>📡 ACTIVITY LOG</h2>
+        <div class="log-feed" id="log-feed"></div>
+      </div>
+
+      <!-- Controls -->
+      <div class="panel controls">
+        <h2>⚙ CONTROLS</h2>
+        <button id="btn-pause">⏸ Pause</button>
+        <button id="btn-regen">↺ New World</button>
+      </div>
+
+      <p>
+        Inspired by <a href="https://github.com/pablodelucca/pixel-agents" target="_blank">pixel-agents</a>
+        · Sprites from <a href="https://github.com/PMDCollab/SpriteCollab" target="_blank">PMDCollab</a>
+      </p>
+    </div>
+
+  </div>
+
+  <script type="module">
+    import { AgentWorld } from './src/agent-world.js';
+    import { POKEMON_DEFS } from './src/config.js';
+
+    let agentWorld = null;
+    let paused     = false;
+
+    const AGENT_DEFS = [
+      { pokemon: POKEMON_DEFS.SHINY_GRENINJA,     name: 'Agent-1' },
+      { pokemon: POKEMON_DEFS.SHINY_CERULEDGE,    name: 'Agent-2' },
+      { pokemon: POKEMON_DEFS.SHINY_ARMAROUGE,    name: 'Agent-3' },
+      { pokemon: POKEMON_DEFS.SHINY_IRON_VALIANT, name: 'Agent-4' },
+      { pokemon: POKEMON_DEFS.MEGA_DIANCIE,       name: 'Orchestrator' },
+      { pokemon: POKEMON_DEFS.SHINY_YVELTAL,      name: 'Agent-5' },
+    ];
+
+    function init(seed) {
+      if (agentWorld) agentWorld.stop();
+
+      agentWorld = new AgentWorld(
+        document.getElementById('agent-canvas'),
+        document.getElementById('log-feed'),
+        { seed, agents: AGENT_DEFS },
+      );
+      agentWorld.start();
+
+      buildUI();
+    }
+
+    function buildUI() {
+      // Populate agent select
+      const sel = document.getElementById('dispatch-agent');
+      sel.innerHTML = '<option value="-1">Random idle agent</option>';
+      AGENT_DEFS.forEach((def, i) => {
+        const opt = document.createElement('option');
+        opt.value       = i;
+        opt.textContent = def.name;
+        sel.append(opt);
+      });
+
+      // Agent status rows
+      const statusEl = document.getElementById('agent-status');
+      statusEl.innerHTML = '';
+      AGENT_DEFS.forEach((def, i) => {
+        const row  = document.createElement('div');
+        row.className  = 'agent-row';
+        row.id         = `agent-row-${i}`;
+        const dot  = document.createElement('div');
+        dot.className  = 'agent-dot';
+        dot.style.background = def.pokemon.color;
+        const name = document.createElement('span');
+        name.className = 'agent-name';
+        name.textContent = def.name;
+        const state = document.createElement('span');
+        state.className = 'agent-state';
+        state.id        = `agent-state-${i}`;
+        state.textContent = 'IDLE';
+        row.append(dot, name, state);
+        statusEl.append(row);
+      });
+
+      // Live status update
+      setInterval(() => {
+        if (!agentWorld) return;
+        agentWorld.agents.forEach((agent, i) => {
+          const el = document.getElementById(`agent-state-${i}`);
+          if (!el) return;
+          const stateColors = {
+            idle: '#668', walk: '#88f', sleep: '#66a',
+            battle: '#f88', hurt: '#f55', work: '#ff0',
+          };
+          el.textContent = agent.state.toUpperCase();
+          el.style.color = stateColors[agent.state] ?? '#aaa';
+        });
+      }, 200);
+    }
+
+    // Dispatch button
+    document.getElementById('btn-dispatch').addEventListener('click', () => {
+      const agentIdx = parseInt(document.getElementById('dispatch-agent').value);
+      const task     = document.getElementById('dispatch-task').value.trim();
+      if (!task || !agentWorld) return;
+
+      if (agentIdx === -1) {
+        const idle = agentWorld.agents.filter(a => a.state === 'idle');
+        if (idle.length > 0) {
+          const pick = idle[Math.floor(Math.random() * idle.length)];
+          pick.assignWork(task);
+          agentWorld._log(`⚡ ${pick.agentName}: "${task}"`);
+        }
+      } else {
+        agentWorld.dispatchWork(agentIdx, task);
+      }
+      document.getElementById('dispatch-task').value = '';
+    });
+
+    document.getElementById('btn-dispatch-all').addEventListener('click', () => {
+      const task = document.getElementById('dispatch-task').value.trim();
+      if (!task || !agentWorld) return;
+      agentWorld.agents.forEach(a => a.assignWork(task));
+      agentWorld._log(`📡 ALL AGENTS: "${task}"`);
+      document.getElementById('dispatch-task').value = '';
+    });
+
+    document.getElementById('btn-pause').addEventListener('click', () => {
+      paused = !paused;
+      if (paused) {
+        agentWorld.stop();
+        document.getElementById('btn-pause').textContent = '▶ Resume';
+      } else {
+        agentWorld.start();
+        document.getElementById('btn-pause').textContent = '⏸ Pause';
+      }
+    });
+
+    document.getElementById('btn-regen').addEventListener('click', () => {
+      paused = false;
+      document.getElementById('btn-pause').textContent = '⏸ Pause';
+      init(Math.floor(Math.random() * 99999));
+    });
+
+    // Enter key in task input
+    document.getElementById('dispatch-task').addEventListener('keydown', e => {
+      if (e.key === 'Enter') document.getElementById('btn-dispatch').click();
+    });
+
+    init(77);
+  </script>
+
+</body>
+</html>

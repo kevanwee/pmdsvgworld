@@ -1,0 +1,10 @@
+{
+  "name": "pmdsvgworld",
+  "version": "1.0.0",
+  "description": "Pokemon Mystery Dungeon SVG world with autonomous NPCs and Claude agent visualizer",
+  "type": "module",
+  "scripts": {
+    "start": "npx serve . -p 3000",
+    "dev": "npx serve . -p 3000"
+  }
+}

@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PMD Pokemon World – LinkedIn SVG Preview</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0a0a1a;
+      color: #eee;
+      font-family: 'Press Start 2P', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 20px;
+      gap: 16px;
+    }
+
+    h1 {
+      font-size: 13px;
+      color: #88ddff;
+      text-shadow: 0 0 12px #0088ff;
+      letter-spacing: 1px;
+      text-align: center;
+    }
+
+    .subtitle {
+      font-size: 7px;
+      color: #667;
+      text-align: center;
+    }
+
+    .canvas-wrapper {
+      position: relative;
+      border: 2px solid #334;
+      border-radius: 4px;
+      box-shadow: 0 0 40px rgba(0,120,255,0.2), 0 0 80px rgba(0,40,120,0.15);
+      overflow: hidden;
+      width: 100%;
+      max-width: 1024px;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      image-rendering: pixelated;
+    }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    button {
+      font-family: inherit;
+      font-size: 8px;
+      background: #1a1a3a;
+      color: #88ddff;
+      border: 1px solid #334;
+      border-radius: 3px;
+      padding: 8px 14px;
+      cursor: pointer;
+      transition: background 0.15s, box-shadow 0.15s;
+    }
+    button:hover {
+      background: #2a2a5a;
+      box-shadow: 0 0 8px rgba(100,180,255,0.3);
+    }
+
+    .pokemon-legend {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      justify-content: center;
+      max-width: 1024px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 6px;
+      color: #aaa;
+    }
+
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.2);
+      flex-shrink: 0;
+    }
+
+    .info {
+      font-size: 6px;
+      color: #556;
+      text-align: center;
+      line-height: 2;
+      max-width: 800px;
+    }
+
+    a {
+      color: #88aaff;
+      text-decoration: none;
+    }
+    a:hover { color: #aaccff; }
+  </style>
+</head>
+<body>
+
+  <h1>◆ POKEMON MYSTERY DUNGEON WORLD ◆</h1>
+  <p class="subtitle">autonomous npc pokemon roaming the land</p>
+
+  <div class="canvas-wrapper">
+    <canvas id="world-canvas"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="btn-pause">⏸ Pause</button>
+    <button id="btn-regen">↺ New World</button>
+    <button id="btn-agents">⚔ Agent View →</button>
+    <button id="btn-export">↓ Export SVG</button>
+  </div>
+
+  <div class="pokemon-legend" id="legend"></div>
+
+  <p class="info">
+    Sprites from <a href="https://github.com/PMDCollab/SpriteCollab" target="_blank">PMDCollab SpriteCollab</a>
+    &nbsp;·&nbsp; Tilemap inspired by
+    <a href="https://raks-olho.itch.io/pokemon-mystery-dungeon-map-generator" target="_blank">PMD Map Generator</a>
+    <br>
+    ● Pokemon wander, idle, sleep and battle one another autonomously
+    &nbsp;·&nbsp; Hover canvas for info
+  </p>
+
+  <script type="module">
+    import { World } from './src/world.js';
+    import { WORLD_POKEMON } from './src/config.js';
+
+    let world = null;
+    let paused = false;
+    let seed   = 42;
+
+    function init(s) {
+      if (world) world.stop();
+      seed  = s;
+      world = new World(document.getElementById('world-canvas'), { seed });
+      world.start();
+    }
+
+    // Legend
+    const legend = document.getElementById('legend');
+    for (const p of WORLD_POKEMON) {
+      const item = document.createElement('div');
+      item.className = 'legend-item';
+      const dot = document.createElement('div');
+      dot.className   = 'legend-dot';
+      dot.style.background = p.color;
+      const label = document.createElement('span');
+      label.textContent = p.name;
+      item.append(dot, label);
+      legend.append(item);
+    }
+
+    // Controls
+    document.getElementById('btn-pause').addEventListener('click', () => {
+      paused = !paused;
+      if (paused) {
+        world.stop();
+        document.getElementById('btn-pause').textContent = '▶ Resume';
+      } else {
+        world.start();
+        document.getElementById('btn-pause').textContent = '⏸ Pause';
+      }
+    });
+
+    document.getElementById('btn-regen').addEventListener('click', () => {
+      paused = false;
+      document.getElementById('btn-pause').textContent = '⏸ Pause';
+      init(Math.floor(Math.random() * 99999));
+    });
+
+    document.getElementById('btn-agents').addEventListener('click', () => {
+      window.location.href = 'agents.html';
+    });
+
+    document.getElementById('btn-export').addEventListener('click', () => {
+      // Snapshot current canvas frame as SVG-embedded PNG
+      const canvas = document.getElementById('world-canvas');
+      const dataUrl = canvas.toDataURL('image/png');
+      const w = canvas.width, h = canvas.height;
+
+      const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+  <image href="${dataUrl}" width="${w}" height="${h}"/>
+  <text x="10" y="${h - 10}" font-family="monospace" font-size="10" fill="#ffffff80">
+    Pokemon Mystery Dungeon World · PMDCollab SpriteCollab
+  </text>
+</svg>`;
+      const blob = new Blob([svg], { type: 'image/svg+xml' });
+      const a = document.createElement('a');
+      a.href     = URL.createObjectURL(blob);
+      a.download = 'pokemon-world.svg';
+      a.click();
+    });
+
+    init(seed);
+  </script>
+
+</body>
+</html>

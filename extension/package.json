@@ -1,0 +1,74 @@
+{
+  "name": "pmd-agent-world",
+  "displayName": "PMD Pokemon Agent World",
+  "description": "Visualize Claude agents as Pokemon in a Pokemon Mystery Dungeon-style world. Agents attack a training dummy when working; agent collisions trigger Pokemon battles.",
+  "version": "0.1.0",
+  "publisher": "pmdsvgworld",
+  "icon": "media/icon.png",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Visualization", "Other"],
+  "keywords": ["claude", "agents", "pokemon", "visualizer", "pixel-art"],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "pmdworld.openAgentWorld",
+        "title": "PMD: Open Agent World",
+        "category": "PMD",
+        "icon": "$(symbol-event)"
+      },
+      {
+        "command": "pmdworld.dispatchTask",
+        "title": "PMD: Dispatch Task to Agent",
+        "category": "PMD"
+      },
+      {
+        "command": "pmdworld.dispatchToAll",
+        "title": "PMD: Dispatch Task to All Agents",
+        "category": "PMD"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "pmdworld.openAgentWorld" },
+        { "command": "pmdworld.dispatchTask",   "when": "pmdworld.panelOpen" },
+        { "command": "pmdworld.dispatchToAll",  "when": "pmdworld.panelOpen" }
+      ]
+    },
+    "configuration": {
+      "title": "PMD Agent World",
+      "properties": {
+        "pmdworld.autoDispatch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically dispatch random tasks to idle agents"
+        },
+        "pmdworld.autoDispatchIntervalMs": {
+          "type": "number",
+          "default": 4000,
+          "description": "Interval (ms) between auto-dispatched tasks"
+        },
+        "pmdworld.seed": {
+          "type": "number",
+          "default": 42,
+          "description": "World generation seed (change to get a different map)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "bundle":  "node esbuild.mjs",
+    "watch":   "node esbuild.mjs --watch",
+    "package": "vsce package --no-dependencies",
+    "vscode:prepublish": "npm run bundle"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node":   "^20.0.0",
+    "typescript":    "^5.3.0",
+    "esbuild":       "^0.20.0",
+    "@vscode/vsce":  "^2.22.0"
+  }
+}
