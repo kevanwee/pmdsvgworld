@@ -4,19 +4,32 @@
 const SPRITE_BASE_LOCAL  = './assets/sprites';
 const SPRITE_BASE_REMOTE = 'https://raw.githubusercontent.com/PMDCollab/SpriteCollab/master/sprite';
 
+// SpriteCollab URL structure (verified against live repo):
+//   Base normal:  sprite/{id}/0000/0000/{anim}-Anim.png
+//                 OR sprite/{id}/{anim}-Anim.png  (short alias, works too)
+//   Base shiny:   sprite/{id}/0000/0001/{anim}-Anim.png
+//   Mega normal:  sprite/{id}/{form}/{anim}-Anim.png  (e.g. 0719/0001/Walk-Anim.png)
+//   Mega shiny:   sprite/{id}/{form}/0001/{anim}-Anim.png  (e.g. 0719/0001/0001/Walk-Anim.png)
+
 function spriteUrl(id, animation, shiny = false, form = null) {
-  const formPath  = form  ? `/${form}`  : '';
-  const shinyPath = shiny ? '/Shiny'    : '';
-  const suffix    = `${formPath}${shinyPath}/${animation}-Anim.png`;
-  // Local path used when served via npm start; remote fallback otherwise.
-  return `${SPRITE_BASE_LOCAL}/${id}${suffix}`;
+  // For Mega / alternate forms, the subform shiny sits under {form}/0001/
+  // For base form shiny, it's 0000/0001/
+  let path;
+  if (form && shiny)        path = `${id}/${form}/0001/${animation}-Anim.png`;
+  else if (form)            path = `${id}/${form}/${animation}-Anim.png`;
+  else if (shiny)           path = `${id}/0000/0001/${animation}-Anim.png`;
+  else                      path = `${id}/${animation}-Anim.png`;
+  return `${SPRITE_BASE_LOCAL}/${path}`;
 }
 
 // Remote fallback (used by SVG generator which runs outside the server)
 export function remoteSpriteUrl(id, animation, shiny = false, form = null) {
-  const formPath  = form  ? `/${form}`  : '';
-  const shinyPath = shiny ? '/Shiny'    : '';
-  return `${SPRITE_BASE_REMOTE}/${id}${formPath}${shinyPath}/${animation}-Anim.png`;
+  let path;
+  if (form && shiny)   path = `${id}/${form}/0001/${animation}-Anim.png`;
+  else if (form)       path = `${id}/${form}/${animation}-Anim.png`;
+  else if (shiny)      path = `${id}/0000/0001/${animation}-Anim.png`;
+  else                 path = `${id}/${animation}-Anim.png`;
+  return `${SPRITE_BASE_REMOTE}/${path}`;
 }
 
 export const PORTRAIT_BASE_LOCAL  = './assets/sprites';
