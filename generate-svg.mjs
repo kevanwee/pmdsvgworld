@@ -2,23 +2,59 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { POKEMON_DEFS } from './src/config.js';
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-const SEED    = 42;
+// ─── Layout constants ─────────────────────────────────────────────────────────
 const SVG_W   = 960;
 const SVG_H   = 540;
-const TS      = 20;           // tile size px
-const MAP_W   = SVG_W / TS;  // 48
-const MAP_H   = SVG_H / TS;  // 27
+const TS      = 30;          // tile px — bigger tiles = more visible texture
+const MAP_W   = Math.floor(SVG_W / TS);   // 32
+const MAP_H   = Math.floor(SVG_H / TS);   // 18
 const TITLE_H = 28;
 const LEG_H   = 22;
-// Playfield rows (tile coords) that are safe for dungeon rooms
-const ROW_MIN = Math.ceil(TITLE_H / TS);                        // 2
-const ROW_MAX = Math.floor((SVG_H - LEG_H) / TS) - 1;          // 24
+const ROW_MIN = Math.ceil(TITLE_H / TS);                        // 1
+const ROW_MAX = Math.floor((SVG_H - LEG_H) / TS) - 1;          // 16
 
+// ─── Battle / movement timing ─────────────────────────────────────────────────
+const STEP_DUR     = 0.20;   // seconds per tile  (constant for ALL pokemon)
+const WALK_TILES   = 14;     // one-way walk steps before encounter
+const PRE_DUR      = 0.20;   // stand facing each other
+const PHASE_DUR    = 0.55;   // one attack exchange (attacker + hurt overlap)
+const POST_DUR     = 0.20;   // brief disengage pause
+const BATTLE_TOTAL = PRE_DUR + 2 * PHASE_DUR + POST_DUR;          // 1.50 s
+const PAIR_DUR     = 2 * WALK_TILES * STEP_DUR + BATTLE_TOTAL;    // 2*14*0.2+1.5 = 7.1 s
+
+// Fractional time markers (0–1, with total cycle = PAIR_DUR)
+const bs = (WALK_TILES * STEP_DUR) / PAIR_DUR;      // battle start  ≈ 0.394
+const t1 = bs  + PRE_DUR   / PAIR_DUR;              // A attacks/B hurts ≈ 0.422
+const t2 = t1  + PHASE_DUR / PAIR_DUR;              // B attacks/A hurts ≈ 0.499
+const t3 = t2  + PHASE_DUR / PAIR_DUR;              // post-battle idle  ≈ 0.576
+const be = t3  + POST_DUR  / PAIR_DUR;              // resume walking    ≈ 0.606
+
+const SEED    = 42;
 const POKEMON = Object.values(POKEMON_DEFS);
 
 // Tile type constants
 const T = { WALL: 0, FLOOR: 1, CORR: 2, WATER: 3, STAIR: 5, ITEM: 6, TRAP: 7 };
+
+// PMD EoS colour palette (SkyTemple reference)
+const C = {
+  bgDark:      '#12102A',
+  wallInner:   '#1C1838',
+  wallFace:    '#302660',   // top-face strip at floor→wall edge
+  floorGrout:  '#3C4272',
+  floorFill:   '#5A6494',
+  floorHi:     '#7888B2',   // top-left bevel
+  floorSh:     '#484E7E',   // bottom-right bevel
+  corrGrout:   '#323060',
+  corrFill:    '#485080',
+  corrHi:      '#586090',
+  waterFill:   '#1A54C8',
+  waterShine:  '#4080F0',
+  stairFill:   '#7A5C1C',
+  stairHi:     '#B88A30',
+  itemOrb:     '#FFD040',
+  itemStroke:  '#B89020',
+  trapFill:    'rgba(180,0,0,0.92)',
+};
 
 // ─── RNG ──────────────────────────────────────────────────────────────────────
 function makeRng(seed) {
@@ -28,6 +64,8 @@ function makeRng(seed) {
 const rng = makeRng(SEED * 31337);
 const ri  = (lo, hi) => Math.floor(rng() * (hi - lo)) + lo;
 const rf  = (lo, hi) => rng() * (hi - lo) + lo;
+const f1  = n => n.toFixed(1);
+const f5  = n => n.toFixed(5);
 
 // ─── Sprite helpers ───────────────────────────────────────────────────────────
 function pngSize(fp) {
@@ -42,7 +80,8 @@ function parseAnim(pngPath, animName) {
     if (existsSync(xp)) {
       const xml = readFileSync(xp, 'utf8');
       const m = xml.match(new RegExp(
-        `<Name>${animName}<\\/Name>[\\s\\S]*?<FrameWidth>(\\d+)<\\/FrameWidth>[\\s\\S]*?<FrameHeight>(\\d+)<\\/FrameHeight>[\\s\\S]*?<Durations>([\\s\\S]*?)<\\/Durations>`
+        `<Name>${animName}<\\/Name>[\\s\\S]*?<FrameWidth>(\\d+)<\\/FrameWidth>` +
+        `[\\s\\S]*?<FrameHeight>(\\d+)<\\/FrameHeight>[\\s\\S]*?<Durations>([\\s\\S]*?)<\\/Durations>`
       ));
       if (m) {
         const durs = [...m[3].matchAll(/<Duration>(\d+)<\/Duration>/g)];
@@ -55,375 +94,336 @@ function parseAnim(pngPath, animName) {
   return null;
 }
 
-// PMD sprite sheet row: 0=S 1=SE 2=E 3=NE 4=N 5=NW 6=W 7=SW
+// PMD sprite-sheet row: 0=S 1=SE 2=E 3=NE 4=N 5=NW 6=W 7=SW
 function dirRow(dx, dy) {
   if (!dx && !dy) return 0;
-  const sec = Math.round((Math.atan2(dy, dx) / (Math.PI / 4) + 8)) % 8;
-  return [2, 1, 0, 7, 6, 5, 4, 3][sec];
+  return [2, 1, 0, 7, 6, 5, 4, 3][Math.round((Math.atan2(dy, dx) / (Math.PI / 4) + 8)) % 8];
 }
 
-// ─── Dungeon generator ────────────────────────────────────────────────────────
+// ─── Dungeon generator (4×3 sector grid) ──────────────────────────────────────
 function generateDungeon() {
   const W = MAP_W, H = MAP_H;
-  const grid = Array.from({ length: H }, () => new Uint8Array(W)); // all WALL
+  const grid = Array.from({ length: H }, () => new Uint8Array(W));
 
-  // 4 columns × 3 rows of sectors
   const COLS = 4, ROWS = 3;
-  const secW = Math.floor(W / COLS);
-  const secH = Math.floor((ROW_MAX - ROW_MIN + 1) / ROWS);
+  const secW = Math.floor(W / COLS);                          // 8
+  const secH = Math.floor((ROW_MAX - ROW_MIN + 1) / ROWS);   // 5
   const rooms = [];
 
   for (let ry = 0; ry < ROWS; ry++) {
     for (let rx = 0; rx < COLS; rx++) {
-      const sx = rx * secW;
-      const sy = ROW_MIN + ry * secH;
-      const rw = ri(4, secW - 2);
-      const rh = ri(3, secH - 1);
-      const ox = sx + 1 + ri(0, Math.max(1, secW - rw - 2));
-      const oy = sy + 1 + ri(0, Math.max(1, secH - rh - 1));
+      const sx = rx * secW, sy = ROW_MIN + ry * secH;
+      const rw = ri(3, secW - 1);
+      const rh = ri(2, secH);
+      const ox = sx + 1 + ri(0, Math.max(1, secW - rw - 1));
+      const oy = sy + 0 + ri(0, Math.max(1, secH - rh));
       for (let y = oy; y < oy + rh && y < H; y++)
         for (let x = ox; x < ox + rw && x < W; x++)
           grid[y][x] = T.FLOOR;
-      rooms.push({ x: ox, y: oy, w: rw, h: rh,
-                   cx: ox + (rw >> 1), cy: oy + (rh >> 1) });
+      rooms.push({ x: ox, y: oy, w: rw, h: rh, cx: ox + (rw >> 1), cy: oy + (rh >> 1) });
     }
   }
 
-  // Carve 1-tile-wide L-shaped corridor between two centers
+  // 1-tile-wide L-shaped corridors
   function carve(ax, ay, bx, by) {
-    for (let x = Math.min(ax, bx); x <= Math.max(ax, bx); x++)
-      if (grid[ay]?.[x] !== undefined && grid[ay][x] === T.WALL) grid[ay][x] = T.CORR;
-    for (let y = Math.min(ay, by); y <= Math.max(ay, by); y++)
-      if (grid[y]?.[bx] !== undefined && grid[y][bx] === T.WALL) grid[y][bx] = T.CORR;
+    for (let x = Math.min(ax,bx); x <= Math.max(ax,bx); x++) if (grid[ay]?.[x] === T.WALL) grid[ay][x] = T.CORR;
+    for (let y = Math.min(ay,by); y <= Math.max(ay,by); y++) if (grid[y]?.[bx] === T.WALL) grid[y][bx] = T.CORR;
+  }
+  for (let ry = 0; ry < ROWS; ry++) for (let rx = 0; rx < COLS; rx++) {
+    const c = rooms[ry*COLS+rx];
+    if (rx+1 < COLS) { const r = rooms[ry*COLS+rx+1]; carve(c.cx, c.cy, r.cx, r.cy); }
+    if (ry+1 < ROWS) { const d = rooms[(ry+1)*COLS+rx]; carve(c.cx, c.cy, d.cx, d.cy); }
   }
 
-  for (let ry = 0; ry < ROWS; ry++) {
-    for (let rx = 0; rx < COLS; rx++) {
-      const c = rooms[ry * COLS + rx];
-      if (rx + 1 < COLS) { const r = rooms[ry * COLS + rx + 1]; carve(c.cx, c.cy, r.cx, r.cy); }
-      if (ry + 1 < ROWS) { const d = rooms[(ry + 1) * COLS + rx]; carve(c.cx, c.cy, d.cx, d.cy); }
-    }
-  }
+  // Water in 1 random room
+  const wr = rooms[ri(0, rooms.length)];
+  for (let y = wr.y+1; y < wr.y+wr.h-1 && y < H; y++)
+    for (let x = wr.x+1; x < wr.x+wr.w-1 && x < W; x++)
+      if (grid[y][x] === T.FLOOR) grid[y][x] = T.WATER;
 
-  // Water patches in 2 rooms
-  for (let i = 0; i < 2; i++) {
-    const r = rooms[ri(0, rooms.length)];
-    for (let y = r.y + 1; y < r.y + r.h - 1 && y < H; y++)
-      for (let x = r.x + 1; x < r.x + r.w - 1 && x < W; x++)
-        if (grid[y][x] === T.FLOOR) grid[y][x] = T.WATER;
-  }
-
-  // Downstairs in last room; scatter items + traps
-  const lr = rooms[rooms.length - 1];
+  // Stair + scatter items/traps
+  const lr = rooms[rooms.length-1];
   grid[lr.cy][lr.cx] = T.STAIR;
   let placed = 0;
   for (let a = 0; a < 500 && placed < 6; a++) {
-    const tx = ri(0, W), ty = ri(ROW_MIN, ROW_MAX + 1);
+    const tx = ri(1, W-1), ty = ri(ROW_MIN, ROW_MAX+1);
     if (grid[ty][tx] === T.FLOOR) { grid[ty][tx] = placed++ < 3 ? T.ITEM : T.TRAP; }
   }
 
   return { grid, rooms, W, H };
 }
 
-// ─── BFS pathfind through walkable dungeon tiles ──────────────────────────────
+// ─── BFS (cardinal moves only) ───────────────────────────────────────────────
 function bfsPath(grid, W, H, sx, sy, ex, ey) {
-  const isWalkable = (x, y) =>
-    x >= 0 && x < W && y >= 0 && y < H && grid[y][x] !== T.WALL;
-
-  if (!isWalkable(sx, sy) || !isWalkable(ex, ey))
-    return [{ x: sx, y: sy }, { x: ex, y: ey }];
-
-  const dist = new Int32Array(W * H).fill(-1);
-  const prev = new Int32Array(W * H).fill(-1);
-  const DIRS = [[1,0],[0,1],[-1,0],[0,-1]]; // cardinal only (PMD-authentic corridors)
-  const q = [];
-  const si = sy * W + sx;
-  dist[si] = 0;
-  q.push(si);
-
-  outer: for (let qi = 0; qi < q.length; qi++) {
-    const idx = q[qi];
-    if (idx === ey * W + ex) break outer;
-    const cx = idx % W, cy = (idx / W) | 0;
-    for (const [ddx, ddy] of DIRS) {
-      const nx = cx + ddx, ny = cy + ddy, ni = ny * W + nx;
-      if (isWalkable(nx, ny) && dist[ni] === -1) {
-        dist[ni] = dist[idx] + 1;
-        prev[ni] = idx;
-        q.push(ni);
-      }
+  const ok = (x,y) => x>=0&&x<W&&y>=0&&y<H && grid[y][x]!==T.WALL;
+  if (!ok(sx,sy)||!ok(ex,ey)) return [{x:sx,y:sy},{x:ex,y:ey}];
+  const dist = new Int32Array(W*H).fill(-1);
+  const prev = new Int32Array(W*H).fill(-1);
+  const q = [sy*W+sx]; dist[sy*W+sx] = 0;
+  const DIRS = [[1,0],[0,1],[-1,0],[0,-1]];
+  for (let qi=0; qi<q.length; qi++) {
+    const idx=q[qi]; if (idx===ey*W+ex) break;
+    const cx=idx%W, cy=idx/W|0;
+    for (const [dx,dy] of DIRS) {
+      const ni=(cy+dy)*W+(cx+dx);
+      if (ok(cx+dx,cy+dy)&&dist[ni]===-1) { dist[ni]=dist[idx]+1; prev[ni]=idx; q.push(ni); }
     }
   }
-
-  const path = [];
-  let cur = ey * W + ex;
-  while (cur !== -1 && cur !== si) { path.push({ x: cur % W, y: (cur / W) | 0 }); cur = prev[cur]; }
-  path.push({ x: sx, y: sy });
+  const path=[]; let cur=ey*W+ex;
+  while (cur!==-1) { path.push({x:cur%W,y:cur/W|0}); cur=prev[cur]; }
   return path.reverse();
 }
 
-// ─── PMD EoS dungeon tile patterns ────────────────────────────────────────────
-function buildTilePatterns(ts) {
-  const s = (x, y, w, h, c) => `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${c}"/>`;
-  const pat = (id, body) =>
-    `<pattern id="${id}" x="0" y="0" width="${ts}" height="${ts}" patternUnits="userSpaceOnUse">${body}</pattern>`;
+// ─── Per-tile inline rendering (NO SVG <pattern>) ────────────────────────────
+// SkyTemple tile logic: each tile drawn as stacked <rect> elements
+// Gives full control and avoids pattern rendering issues in any SVG viewer.
+function renderTile(tx, ty, type) {
+  const r = (x,y,w,h,c,extra='') =>
+    `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${c}"${extra}/>`;
+  switch (type) {
+    case T.WALL:
+      return r(tx,ty,TS,TS,C.bgDark) +
+             r(tx+1,ty+1,TS-2,TS-2,C.wallInner);
 
-  // PMD EoS blue-purple dungeon palette
-  // WALL — very dark purple with slight inner detail
-  const wallBody = [
-    s(0, 0, ts, ts, '#1E1533'),
-    s(1, 1, ts - 2, ts - 2, '#231A3C'),
-  ].join('');
+    case T.FLOOR:
+      return r(tx,   ty,   TS,   TS,   C.floorGrout) +       // grout border
+             r(tx+1, ty+1, TS-2, TS-2, C.floorFill)  +       // main stone
+             r(tx+1, ty+1, TS-2, 1,    C.floorHi)    +       // top highlight
+             r(tx+1, ty+1, 1,    TS-3, C.floorHi)    +       // left highlight
+             r(tx+1, ty+TS-2,TS-2,1,   C.floorSh)    +       // bottom shadow
+             r(tx+TS-2,ty+2,1,  TS-3,  C.floorSh);           // right shadow
 
-  // FLOOR — blue-gray stone with 1px grout borders around each tile
-  // Bevel effect: top-left edges lighter, bottom-right edges slightly darker
-  const floorBody = [
-    s(0, 0, ts, ts, '#404A78'),           // grout / outer border color
-    s(1, 1, ts - 2, ts - 2, '#6878A8'),   // main stone fill
-    s(1, 1, ts - 2, 1, '#8090C0'),        // top highlight
-    s(1, 1, 1, ts - 2, '#8090C0'),        // left highlight
-    s(1, ts - 2, ts - 2, 1, '#505888'),   // bottom shadow
-    s(ts - 2, 1, 1, ts - 2, '#505888'),   // right shadow
-  ].join('');
+    case T.CORR:
+      return r(tx,   ty,   TS,   TS,   C.corrGrout) +
+             r(tx+1, ty+1, TS-2, TS-2, C.corrFill)  +
+             r(tx+1, ty+1, TS-2, 1,    C.corrHi)    +
+             r(tx+1, ty+1, 1,    TS-3, C.corrHi);
 
-  // CORRIDOR — slightly darker/more muted than floor
-  const corrBody = [
-    s(0, 0, ts, ts, '#363E68'),
-    s(1, 1, ts - 2, ts - 2, '#505878'),
-    s(1, 1, ts - 2, 1, '#606888'),        // top highlight
-    s(1, 1, 1, ts - 2, '#606888'),        // left highlight
-  ].join('');
+    case T.WATER:
+      return r(tx, ty, TS, TS, C.waterFill) +
+             r(tx, ty+Math.round(TS*0.28), TS, 2, C.waterShine, ' opacity="0.6"') +
+             r(tx, ty+Math.round(TS*0.64), TS, 2, C.waterShine, ' opacity="0.6"');
 
-  // WATER — PMD blue with shimmer lines
-  const waterBody = [
-    s(0, 0, ts, ts, '#2A52B8'),
-    s(0, Math.round(ts * 0.28), ts, 2, '#4878DC'),
-    s(0, Math.round(ts * 0.62), ts, 2, '#4878DC'),
-    s(Math.round(ts * 0.10), Math.round(ts * 0.12), Math.round(ts * 0.38), 1, '#80A8F0'),
-    s(Math.round(ts * 0.52), Math.round(ts * 0.52), Math.round(ts * 0.38), 1, '#80A8F0'),
-  ].join('');
+    case T.STAIR:
+      return r(tx,ty,TS,TS,C.floorGrout) +
+             r(tx+1,ty+1,TS-2,TS-2,C.stairFill) +
+             r(tx+1,ty+1,TS-2,1,C.stairHi) +
+             `<rect x="${tx+Math.round(TS*0.43)}" y="${ty+Math.round(TS*0.2)}" width="${Math.round(TS*0.14)}" height="${Math.round(TS*0.36)}" fill="#2A1A06"/>` +
+             `<polygon points="${f1(tx+TS*0.5)},${f1(ty+TS*0.82)} ${f1(tx+TS*0.27)},${f1(ty+TS*0.52)} ${f1(tx+TS*0.73)},${f1(ty+TS*0.52)}" fill="#2A1A06"/>`;
 
-  // STAIR — golden floor with down-arrow
-  const stairBody = [
-    s(0, 0, ts, ts, '#404A78'),
-    s(1, 1, ts - 2, ts - 2, '#907838'),
-    s(1, 1, ts - 2, 1, '#C0A848'),
-    s(1, 1, 1, ts - 2, '#C0A848'),
-    `<polygon points="${ts * 0.50},${ts * 0.78} ${ts * 0.30},${ts * 0.48} ${ts * 0.70},${ts * 0.48}" fill="#503010"/>`,
-    s(Math.round(ts * 0.44), Math.round(ts * 0.22), Math.round(ts * 0.12), Math.round(ts * 0.28), '#503010'),
-  ].join('');
+    case T.ITEM:
+      return r(tx,ty,TS,TS,C.floorGrout) +
+             r(tx+1,ty+1,TS-2,TS-2,C.floorFill) +
+             `<circle cx="${f1(tx+TS*0.5)}" cy="${f1(ty+TS*0.5)}" r="${f1(TS*0.25)}" fill="${C.itemOrb}" stroke="${C.itemStroke}" stroke-width="0.8"/>` +
+             `<circle cx="${f1(tx+TS*0.41)}" cy="${f1(ty+TS*0.41)}" r="${f1(TS*0.08)}" fill="white" opacity="0.55"/>`;
 
-  // ITEM — blue floor with golden orb
-  const itemBody = [
-    s(0, 0, ts, ts, '#404A78'),
-    s(1, 1, ts - 2, ts - 2, '#6878A8'),
-    `<circle cx="${ts * 0.50}" cy="${ts * 0.50}" r="${ts * 0.27}" fill="#FFD040" stroke="#B89020" stroke-width="0.5"/>`,
-    `<circle cx="${ts * 0.40}" cy="${ts * 0.40}" r="${ts * 0.09}" fill="white" opacity="0.55"/>`,
-  ].join('');
+    case T.TRAP:
+      return r(tx,ty,TS,TS,C.floorGrout) +
+             r(tx+1,ty+1,TS-2,TS-2,C.floorFill) +
+             `<polygon points="${f1(tx+TS*0.5)},${f1(ty+TS*0.19)} ${f1(tx+TS*0.81)},${f1(ty+TS*0.77)} ${f1(tx+TS*0.19)},${f1(ty+TS*0.77)}" fill="${C.trapFill}" stroke="#600" stroke-width="0.5"/>` +
+             `<text x="${f1(tx+TS*0.5)}" y="${f1(ty+TS*0.65)}" text-anchor="middle" font-size="${Math.round(TS*0.30)}" fill="white" font-weight="bold">!</text>`;
 
-  // TRAP — blue floor with red warning triangle
-  const trapBody = [
-    s(0, 0, ts, ts, '#404A78'),
-    s(1, 1, ts - 2, ts - 2, '#6878A8'),
-    `<polygon points="${ts * 0.50},${ts * 0.20} ${ts * 0.80},${ts * 0.76} ${ts * 0.20},${ts * 0.76}" fill="rgba(180,0,0,0.9)" stroke="#600000" stroke-width="0.5"/>`,
-    `<text x="${ts * 0.50}" y="${ts * 0.65}" text-anchor="middle" font-size="${Math.round(ts * 0.30)}" fill="white" font-weight="bold">!</text>`,
-  ].join('');
-
-  return [
-    pat('t-wall', wallBody), pat('t-floor', floorBody), pat('t-corr', corrBody),
-    pat('t-water', waterBody), pat('t-stair', stairBody),
-    pat('t-item', itemBody), pat('t-trap', trapBody),
-  ].join('\n  ');
+    default:
+      return '';
+  }
 }
 
-const T_FILL = {
-  [T.WALL]: 'url(#t-wall)', [T.FLOOR]: 'url(#t-floor)', [T.CORR]: 'url(#t-corr)',
-  [T.WATER]: 'url(#t-water)', [T.STAIR]: 'url(#t-stair)',
-  [T.ITEM]: 'url(#t-item)', [T.TRAP]: 'url(#t-trap)',
-};
+function dungeonToSVG(grid, W, H) {
+  const tiles = [];
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++)
+      tiles.push(renderTile(x*TS, y*TS, grid[y][x]));
 
-// ─── Dungeon → SVG rects with PMD depth shading ───────────────────────────────
-function dungeonToSVG(grid, W, H, ts) {
-  const rects = [];
-  for (let y = 0; y < H; y++) {
-    let run = null;
-    for (let x = 0; x < W; x++) {
-      const fill = T_FILL[grid[y][x]] ?? 'url(#t-wall)';
-      if (run && run.fill === fill) {
-        run.w += ts;
-      } else {
-        if (run) rects.push(run);
-        run = { fill, x: x * ts, y: y * ts, w: ts, h: ts };
-      }
-    }
-    if (run) rects.push(run);
-  }
-
-  // Depth shading at floor/corridor → wall transitions
+  // Wall-face depth strip: lighter purple at top edge of any wall directly below open floor
   const depth = [];
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const c = grid[y][x];
-      const isOpen = c !== T.WALL;
-      // Shadow bar below open tile when wall is beneath (floor appears elevated)
-      if (isOpen && y + 1 < H && grid[y + 1][x] === T.WALL) {
-        depth.push(`<rect x="${x * ts}" y="${(y + 1) * ts}" width="${ts}" height="4" fill="rgba(0,0,0,0.55)"/>`);
-      }
-      // Wall front-face: lighter top edge on walls directly below open tiles
-      if (c === T.WALL && y > 0 && grid[y - 1][x] !== T.WALL) {
-        depth.push(`<rect x="${x * ts}" y="${y * ts}" width="${ts}" height="3" fill="#3A2860"/>`);
-      }
-    }
+  for (let y = 1; y < H; y++) for (let x = 0; x < W; x++) {
+    if (grid[y][x] === T.WALL && grid[y-1][x] !== T.WALL)
+      depth.push(`<rect x="${x*TS}" y="${y*TS}" width="${TS}" height="4" fill="${C.wallFace}"/>`);
+    if (grid[y][x] !== T.WALL && grid[y+1]?.[x] === T.WALL)
+      depth.push(`<rect x="${x*TS}" y="${(y+1)*TS}" width="${TS}" height="3" fill="rgba(0,0,0,0.45)"/>`);
   }
 
-  return rects
-    .map(r => `<rect x="${r.x}" y="${r.y}" width="${r.w + 0.5}" height="${r.h + 0.5}" fill="${r.fill}"/>`)
-    .join('\n') + '\n' + depth.join('\n');
+  return tiles.join('') + depth.join('');
 }
 
-// ─── Water shimmer FX ─────────────────────────────────────────────────────────
-function waterAnimSVG(grid, W, H, ts) {
+function waterAnimSVG(grid, W, H) {
   const lines = [];
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      if (grid[y][x] !== T.WATER) continue;
-      const delay = ((x * 3 + y * 7) % 17) * 0.14;
-      const cy = ((y + 0.44) * ts).toFixed(1);
-      lines.push(
-        `<line x1="${((x + 0.15) * ts).toFixed(1)}" y1="${cy}" x2="${((x + 0.85) * ts).toFixed(1)}" y2="${cy}" ` +
-        `stroke="white" stroke-width="0.8" class="shimmer" style="animation-delay:${delay.toFixed(2)}s"/>`
-      );
-    }
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (grid[y][x] !== T.WATER) continue;
+    const delay = ((x*3+y*7)%17)*0.13;
+    const cy = f1((y+0.43)*TS);
+    lines.push(`<line x1="${f1((x+0.15)*TS)}" y1="${cy}" x2="${f1((x+0.85)*TS)}" y2="${cy}" stroke="white" stroke-width="0.9" class="wsh" style="animation-delay:${delay.toFixed(2)}s"/>`);
   }
-  return lines.join('\n');
+  return lines.join('');
 }
 
-// ─── Build tile-by-tile pokemon animation ─────────────────────────────────────
-// Key fix: each tile step = durSec/frameCount (one walk frame per step, like real PMD)
-function buildPokemonSVG(idx, def, rooms, grid, W, H, delaySec, spriteInfo) {
+// ─── Path building for a battle pair ─────────────────────────────────────────
+// Returns { pathA, pathB, eA, eB } where eA/eB are encounter tiles (adjacent).
+function buildPairPaths(rooms, grid, W, H, ridxA, ridxB) {
+  const rA = rooms[ridxA], rB = rooms[ridxB];
+  const full = bfsPath(grid, W, H, rA.cx, rA.cy, rB.cx, rB.cy);
+  const K = full.length - 1; // steps
+  const m = Math.max(1, K >> 1);
+
+  // Split into A-half and B-half
+  let pathA = full.slice(0, m + 1);           // p[0]..p[m], A ends at p[m]
+  let pathB = full.slice(m + 1).reverse();    // p[m+1]..p[K] reversed, B ends at p[m+1]
+
+  // Ensure B has at least 2 tiles
+  if (pathB.length < 2) pathB = [{ x: full[K].x, y: full[K].y }, { x: full[K].x, y: full[K].y }];
+
+  // Pad / trim to exactly WALK_TILES+1 points (= WALK_TILES steps)
+  function normalisePath(path) {
+    while (path.length < WALK_TILES + 1) path.unshift({ ...path[0] });
+    if (path.length > WALK_TILES + 1) path = path.slice(path.length - (WALK_TILES + 1));
+    return path;
+  }
+  pathA = normalisePath(pathA);
+  pathB = normalisePath(pathB);
+
+  return { pathA, pathB, eA: pathA[WALK_TILES], eB: pathB[WALK_TILES] };
+}
+
+// ─── Build a single pokemon's full SMIL animation ────────────────────────────
+// role: 'A' = attacks first, 'B' = attacked first
+function buildPokemonSVG(pkIdx, def, path, eA, eB, role, delaySec, spriteInfo) {
   if (!spriteInfo) return { defs: '', svg: '' };
 
-  // Pick 2–3 distinct room waypoints via RNG
-  const chosen = [];
-  const used   = new Set();
-  for (let a = 0; a < 300 && chosen.length < 3; a++) {
-    const i = ri(0, rooms.length);
-    if (!used.has(i)) { used.add(i); chosen.push(rooms[i]); }
-  }
+  const { walkUri, sheetW, sheetH, frameW, frameH, frameCount, durSec,
+          idleUri, idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec,
+          atkUri,  atkSheetW,  atkSheetH,  atkFrameW,  atkFrameH,  atkFrameCount,  atkDurSec,
+          hrtUri,  hrtSheetW,  hrtSheetH,  hrtFrameW,  hrtFrameH,  hrtFrameCount,  hrtDurSec } = spriteInfo;
 
-  // BFS stitch between consecutive waypoints
-  let onewayPath = [];
-  for (let i = 0; i < chosen.length - 1; i++) {
-    const a = chosen[i], b = chosen[i + 1];
-    const seg = bfsPath(grid, W, H, a.cx, a.cy, b.cx, b.cy);
-    if (i > 0 && onewayPath.length > 0) seg.shift(); // no duplicate junction tile
-    onewayPath = onewayPath.concat(seg);
-  }
-  if (onewayPath.length < 2) onewayPath = [{ x: chosen[0].cx, y: chosen[0].cy }, { x: chosen[0].cx + 1, y: chosen[0].cy }];
-
-  // Cap one-way path at 35 tiles so total cycle ≤ ~70 steps
-  if (onewayPath.length > 35) onewayPath = onewayPath.slice(0, 35);
-
-  // Round-trip: forward → backward (omit duplicate endpoint)
-  const backward = [...onewayPath].reverse().slice(1);
-  const fullPath  = [...onewayPath, ...backward];
-  const N         = fullPath.length;
-
-  const { walkUri, idleUri, sheetW, sheetH, frameW, frameH, frameCount, durSec,
-          idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec } = spriteInfo;
-
-  // ── PMD-authentic timing: one walk FRAME per tile step ───────────────────────
-  // So the sprite advances by exactly one frame every time it moves one tile.
-  const SC       = 1;            // natural sprite size (no upscaling)
-  const stepDur  = durSec / frameCount;   // one frame duration
-  const totalDur = N * stepDur;           // full loop duration
-
-  // Evenly spaced keyTimes (equal time per tile step)
-  const kts   = Array.from({ length: N + 1 }, (_, i) => (i / N).toFixed(5));
-  const ktStr = kts.join(';');
-
-  // animateTransform values: SVG pixel center of each tile, closed loop
-  const translates = [
-    ...fullPath.map(t => `${(t.x * TS + TS / 2).toFixed(1)},${(t.y * TS + TS / 2).toFixed(1)}`),
-    `${(fullPath[0].x * TS + TS / 2).toFixed(1)},${(fullPath[0].y * TS + TS / 2).toFixed(1)}`,
-  ].join(';');
-
+  // Sprite scale: use 2× for small frames so pokemon are clearly visible
+  const SC  = frameW <= 36 ? 2 : 1;
   const dfw = frameW * SC, dfh = frameH * SC;
-  const hw  = dfw >> 1, hh = dfh >> 1;
+  const hw  = dfw >> 1,    hh  = dfh >> 1;
 
-  // Walk x-animation: cycles all frames at walk speed (matches one step per frame)
-  const xVals = Array.from({ length: frameCount }, (_, f) => -(hw + f * dfw)).join(';');
+  // ── keyTimes and positions for animateTransform ──────────────────────────────
+  // Full sequence: walk forward (WALK_TILES steps) + hold (battle) + walk backward
+  // Total: 2*WALK_TILES+2 keyframe pairs
+  const pathRev = [...path].reverse();
+  const allKts = [
+    ...Array.from({ length: WALK_TILES + 1 }, (_, i) => i * STEP_DUR / PAIR_DUR),
+    be,  // hold until battleEnd
+    ...Array.from({ length: WALK_TILES }, (_, i) => be + (i + 1) * STEP_DUR / PAIR_DUR),
+  ]; // length = 2*WALK_TILES+2
 
-  // Direction y-values for each keyframe (which row of sprite sheet to show)
-  // Computed from direction of travel at that tile step
-  const dirYVals = fullPath.map((t, i) => {
-    const next = fullPath[i + 1] ?? fullPath[0]; // wrap around for last tile
-    return -(hh + dirRow(next.x - t.x, next.y - t.y) * dfh);
-  });
-  dirYVals.push(dirYVals[0]); // closing entry
+  const pixPos = t => `${f1(t.x*TS + TS/2)},${f1(t.y*TS + TS/2)}`;
+  const allPos = [
+    ...path.map(pixPos),             // forward walk: WALK_TILES+1 pts
+    pixPos(path[WALK_TILES]),        // hold at battleEnd
+    ...pathRev.slice(1).map(pixPos), // backward walk: omit first (= hold pos)
+  ]; // length = 2*WALK_TILES+2
 
-  const shadowY  = (hh * 0.40).toFixed(1);
-  const shadowRx = (dfw * 0.38).toFixed(1);
-  const shadowRy = (dfw * 0.09).toFixed(1);
-  const nameY    = (hh * 0.62).toFixed(1);
+  const ktStr  = allKts.map(f5).join(';');
+  const posStr = allPos.join(';');
 
-  const clipId  = `clip${idx}`;
-  const iClipId = `iclip${idx}`;
+  // Walk direction y-values (for the walk sprite row)
+  const dirY = (from, to) => -(hh + dirRow(to.x - from.x, to.y - from.y) * dfh);
+  const allDirY = [
+    // forward walk
+    ...Array.from({ length: WALK_TILES + 1 }, (_, i) => {
+      const from = path[i], to = path[Math.min(i + 1, WALK_TILES)];
+      return dirY(from, to);
+    }),
+    // hold (face toward opponent – naturally set by last forward step)
+    dirY(path[WALK_TILES], { x: (role==='A'?eB:eA).x, y: (role==='A'?eB:eA).y }),
+    // backward walk
+    ...Array.from({ length: WALK_TILES }, (_, i) => {
+      const from = pathRev[i + 1], to = pathRev[Math.min(i + 2, WALK_TILES)];
+      return dirY(from, to);
+    }),
+  ];
 
-  // Clip path defs
+  const clipId = `wc${pkIdx}`;
   let defsStr = `<clipPath id="${clipId}"><rect x="${-hw}" y="${-hh}" width="${dfw}" height="${dfh}"/></clipPath>`;
-  if (idleUri) {
-    const ifw = (idleFrameW || frameW) * SC, ifh = (idleFrameH || frameH) * SC;
-    defsStr += `\n  <clipPath id="${iClipId}"><rect x="${-(ifw >> 1)}" y="${-(ifh >> 1)}" width="${ifw}" height="${ifh}"/></clipPath>`;
+
+  // ── Walk sprite ──────────────────────────────────────────────────────────────
+  const walkXVals = Array.from({ length: frameCount }, (_, f) => -(hw + f * dfw)).join(';');
+  const walkImg = `<image id="w${pkIdx}" href="${walkUri}"
+      x="${-hw}" y="${-hh}" width="${sheetW*SC}" height="${sheetH*SC}" image-rendering="pixelated" clip-path="url(#${clipId})">
+    <animate attributeName="x" values="${walkXVals}" dur="${durSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="y" values="${allDirY.join(';')}" keyTimes="${ktStr}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="inline;none;none;inline" keyTimes="0;${f5(t1)};${f5(t3)};${f5(be)}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+  </image>`;
+
+  // ── Attack sprite ─────────────────────────────────────────────────────────────
+  let atkImg = '', hrtImg = '';
+  if (atkUri && hrtUri) {
+    const aSC = atkFrameW <= 36 ? 2 : 1;
+    const adfw = atkFrameW * aSC, adfh = atkFrameH * aSC;
+    const ahw  = adfw >> 1, ahh = adfh >> 1;
+    const aClipId = `ac${pkIdx}`;
+    defsStr += `\n  <clipPath id="${aClipId}"><rect x="${-ahw}" y="${-ahh}" width="${adfw}" height="${adfh}"/></clipPath>`;
+
+    // Attacker faces toward opponent; we compute row based on role
+    const atkRow = dirRow(
+      (role==='A' ? eB.x - eA.x : eA.x - eB.x),
+      (role==='A' ? eB.y - eA.y : eA.y - eB.y)
+    );
+    const atkY = -(ahh + atkRow * adfh);
+    const atkXVals = Array.from({ length: atkFrameCount }, (_, f) => -(ahw + f * adfw)).join(';');
+    // A attacks during t1→t2, B attacks during t2→t3
+    const atkShow = role === 'A' ? `0;${f5(t1)};${f5(t2)}` : `0;${f5(t2)};${f5(t3)}`;
+
+    atkImg = `<image id="a${pkIdx}" href="${atkUri}"
+      x="${-ahw}" y="${atkY}" width="${atkSheetW*aSC}" height="${atkSheetH*aSC}" image-rendering="pixelated" clip-path="url(#${aClipId})">
+    <animate attributeName="x" values="${atkXVals}" dur="${atkDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="none;inline;none" keyTimes="${atkShow}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+  </image>`;
+
+    // ── Hurt sprite ──────────────────────────────────────────────────────────────
+    const hSC = hrtFrameW <= 36 ? 2 : 1;
+    const hdfw = hrtFrameW * hSC, hdfh = hrtFrameH * hSC;
+    const hhw  = hdfw >> 1, hhh = hdfh >> 1;
+    const hClipId = `hc${pkIdx}`;
+    defsStr += `\n  <clipPath id="${hClipId}"><rect x="${-hhw}" y="${-hhh}" width="${hdfw}" height="${hdfh}"/></clipPath>`;
+
+    // Hurt pokemon faces toward attacker
+    const hrtRow = dirRow(
+      (role==='A' ? eB.x - eA.x : eA.x - eB.x),
+      (role==='A' ? eB.y - eA.y : eA.y - eB.y)
+    );
+    const hrtY = -(hhh + hrtRow * hdfh);
+    const hrtXVals = Array.from({ length: hrtFrameCount }, (_, f) => -(hhw + f * hdfw)).join(';');
+    // A is hurt when B attacks (t2→t3), B is hurt when A attacks (t1→t2)
+    const hrtShow = role === 'A' ? `0;${f5(t2)};${f5(t3)}` : `0;${f5(t1)};${f5(t2)}`;
+
+    hrtImg = `<image id="h${pkIdx}" href="${hrtUri}"
+      x="${-hhw}" y="${hrtY}" width="${hrtSheetW*hSC}" height="${hrtSheetH*hSC}" image-rendering="pixelated" clip-path="url(#${hClipId})">
+    <animate attributeName="x" values="${hrtXVals}" dur="${hrtDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="none;inline;none" keyTimes="${hrtShow}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+  </image>`;
   }
 
-  // Walk image — visible during walk (0–50% and 75–100%), hidden during idle (50–75%)
-  const walkDisplay = idleUri
-    ? `\n      <animate attributeName="display" values="inline;inline;none;inline" keyTimes="0;0.5;0.75;1" ` +
-      `dur="${totalDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>`
-    : '';
+  // Shadow ellipse + name plate geometry
+  const shadowY  = f1(hh * 0.42);
+  const shadowRx = f1(dfw * 0.36);
+  const shadowRy = f1(TS  * 0.12);
+  const nameY    = f1(-hh - 3);
 
-  const walkImg = `<image href="${walkUri}"
-        x="${-hw}" y="${-hh}" width="${sheetW * SC}" height="${sheetH * SC}"
-        image-rendering="pixelated" clip-path="url(#${clipId})">
-      <animate attributeName="x" values="${xVals}"
-        dur="${durSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
-        calcMode="discrete" repeatCount="indefinite"/>
-      <animate attributeName="y" values="${dirYVals.join(';')}" keyTimes="${ktStr}"
-        dur="${totalDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
-        calcMode="discrete" repeatCount="indefinite"/>${walkDisplay}
-    </image>`;
-
-  // Idle image — shown at 50–75% turnaround point
-  let idleImg = '';
-  if (idleUri) {
-    const ifw = (idleFrameW || frameW) * SC, ifh = (idleFrameH || frameH) * SC;
-    const ihw = ifw >> 1, ihh = ifh >> 1;
-    const ixVals = Array.from({ length: idleFrameCount }, (_, f) => -(ihw + f * ifw)).join(';');
-    idleImg = `
-    <image href="${idleUri}"
-        x="${-ihw}" y="${-ihh}" width="${(idleSheetW || sheetW) * SC}" height="${(idleSheetH || sheetH) * SC}"
-        image-rendering="pixelated" clip-path="url(#${iClipId})">
-      <animate attributeName="x" values="${ixVals}"
-        dur="${(idleDurSec || durSec).toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
-        calcMode="discrete" repeatCount="indefinite"/>
-      <animate attributeName="display" values="none;none;inline;none" keyTimes="0;0.5;0.75;1"
-        dur="${totalDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
-        calcMode="discrete" repeatCount="indefinite"/>
-    </image>`;
-  }
+  // ── Battle hit-flash effect at encounter tile ──────────────────────────────
+  // A's attack flash (at opponent's position → relative coords from eA perspective):
+  const flashSelf = role === 'A' ? `0;${f5(t1)};${f5(t1+0.06)};${f5(t2)}` : `0;${f5(t2)};${f5(t2+0.06)};${f5(t3)}`;
+  const flashImg = `<circle cx="0" cy="0" r="${TS*0.7}" fill="white" opacity="0">
+    <animate attributeName="opacity" values="0;0;0.6;0" keyTimes="${flashSelf}" dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>
+  </circle>`;
 
   const svg = `
-  <g id="pk${idx}">
+  <g id="pk${pkIdx}">
     <animateTransform attributeName="transform" type="translate"
-      values="${translates}" keyTimes="${ktStr}"
-      dur="${totalDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
+      values="${posStr}" keyTimes="${ktStr}"
+      dur="${PAIR_DUR.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
       calcMode="linear" repeatCount="indefinite" additive="replace"/>
     <ellipse cx="0" cy="${shadowY}" rx="${shadowRx}" ry="${shadowRy}" fill="rgba(0,0,0,0.55)"/>
-    ${walkImg}${idleImg}
+    ${walkImg}
+    ${atkImg}
+    ${hrtImg}
+    ${flashImg}
     <text y="${nameY}" text-anchor="middle"
-      font-family="'Courier New',monospace" font-size="7"
-      fill="white" stroke="black" stroke-width="2" paint-order="stroke">${def.name}</text>
+      font-family="'Courier New',monospace" font-size="7" font-weight="bold"
+      fill="white" stroke="${def.color}" stroke-width="2.5" paint-order="stroke">${def.name}</text>
   </g>`;
 
   return { defs: defsStr, svg };
@@ -433,102 +433,127 @@ function buildPokemonSVG(idx, def, rooms, grid, W, H, delaySec, spriteInfo) {
 async function main() {
   console.log('Generating PMD dungeon SVG …');
 
-  // Load all sprites
+  // Load sprites: walk + idle + attack + hurt
   const spriteInfos = POKEMON.map(def => {
     const wp = (def.animations.walk ?? '').replace(/^\.\//, '');
-    if (!wp || !existsSync(wp)) { console.warn(`  ⚠ Walk not found: ${wp}`); return null; }
-    const anim = parseAnim(wp, 'Walk');
-    if (!anim) { console.warn(`  ⚠ No Walk AnimData: ${def.name}`); return null; }
-    const { w: sW, h: sH } = pngSize(wp);
+    if (!wp || !existsSync(wp)) { console.warn(`  ⚠ Walk missing: ${def.name}`); return null; }
+    const wa = parseAnim(wp, 'Walk'); if (!wa) { console.warn(`  ⚠ No Walk AnimData: ${def.name}`); return null; }
+    const { w:sW, h:sH } = pngSize(wp);
     const walkUri = `data:image/png;base64,${readFileSync(wp).toString('base64')}`;
-    console.log(`  ✓ ${def.name} Walk ${anim.frameW}×${anim.frameH} ${anim.frameCount}f ${anim.durSec.toFixed(3)}s  stepDur=${(anim.durSec/anim.frameCount).toFixed(3)}s`);
+    console.log(`  ✓ ${def.name}  Walk ${wa.frameW}×${wa.frameH}  ${wa.frameCount}f`);
 
-    const ip = (def.animations.idle ?? '').replace(/^\.\//, '');
-    let idleUri = null, idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec;
-    if (ip && existsSync(ip)) {
-      const ia = parseAnim(ip, 'Idle');
-      if (ia) {
-        const { w: iW, h: iH } = pngSize(ip);
-        idleUri = `data:image/png;base64,${readFileSync(ip).toString('base64')}`;
-        idleSheetW = iW; idleSheetH = iH;
-        idleFrameW = ia.frameW; idleFrameH = ia.frameH;
-        idleFrameCount = ia.frameCount; idleDurSec = ia.durSec;
-        console.log(`    idle ${ia.frameW}×${ia.frameH} ${ia.frameCount}f`);
-      }
+    function loadAnim(animKey, xmlName) {
+      const p = (def.animations[animKey] ?? '').replace(/^\.\//, '');
+      if (!p || !existsSync(p)) { console.warn(`    ⚠ ${xmlName} missing for ${def.name}`); return null; }
+      const a = parseAnim(p, xmlName); if (!a) return null;
+      const { w, h } = pngSize(p);
+      const uri = `data:image/png;base64,${readFileSync(p).toString('base64')}`;
+      console.log(`    ${xmlName}: ${a.frameW}×${a.frameH}  ${a.frameCount}f`);
+      return { uri, sheetW: w, sheetH: h, ...a };
     }
-    return { walkUri, idleUri, sheetW: sW, sheetH: sH, ...anim,
-             idleSheetW, idleSheetH, idleFrameW, idleFrameH, idleFrameCount, idleDurSec };
+
+    const id = loadAnim('idle',   'Idle');
+    const at = loadAnim('attack', 'Attack');
+    const hr = loadAnim('hurt',   'Hurt');
+
+    return {
+      walkUri, sheetW: sW, sheetH: sH, ...wa,
+      idleUri:       id?.uri,   idleSheetW:   id?.sheetW,  idleSheetH:   id?.sheetH,
+      idleFrameW:    id?.frameW, idleFrameH:  id?.frameH,  idleFrameCount:id?.frameCount, idleDurSec:id?.durSec,
+      atkUri:        at?.uri,   atkSheetW:    at?.sheetW,  atkSheetH:    at?.sheetH,
+      atkFrameW:     at?.frameW, atkFrameH:   at?.frameH,  atkFrameCount: at?.frameCount, atkDurSec: at?.durSec,
+      hrtUri:        hr?.uri,   hrtSheetW:    hr?.sheetW,  hrtSheetH:    hr?.sheetH,
+      hrtFrameW:     hr?.frameW, hrtFrameH:   hr?.frameH,  hrtFrameCount: hr?.frameCount, hrtDurSec: hr?.durSec,
+    };
   });
 
   // Generate dungeon
   const { grid, rooms, W, H } = generateDungeon();
-  console.log(`  Dungeon: ${rooms.length} rooms`);
+  console.log(`  Dungeon: ${rooms.length} rooms (${W}×${H} tiles)`);
 
-  // Build one pokemon per entry, staggered start
-  const delays  = POKEMON.map((_, i) => rf(0.5, 3) + i * 1.5);
-  const pkParts = POKEMON.map((def, i) =>
-    buildPokemonSVG(i, def, rooms, grid, W, H, delays[i], spriteInfos[i])
-  );
+  // ── Pair up pokemon: (0,1), (2,3), (4,5) ─────────────────────────────────
+  // Pick room indices far apart for each pair to give interesting paths
+  const pairRoomIdxs = [
+    [0, rooms.length-1],
+    [2, rooms.length-3],
+    [1, rooms.length-2],
+  ];
+
+  const pkParts = [];
+  // Stagger pair start times so battles don't all happen simultaneously
+  const pairDelays = [0.5, PAIR_DUR * 0.34, PAIR_DUR * 0.68];
+
+  for (let pairIdx = 0; pairIdx < 3; pairIdx++) {
+    const [ridxA, ridxB] = pairRoomIdxs[pairIdx];
+    const { pathA, pathB, eA, eB } = buildPairPaths(rooms, grid, W, H, ridxA, ridxB);
+    const delay = pairDelays[pairIdx];
+
+    const idxA = pairIdx * 2;
+    const idxB = pairIdx * 2 + 1;
+    const defA = POKEMON[idxA], defB = POKEMON[idxB];
+
+    pkParts.push(buildPokemonSVG(idxA, defA, pathA, eA, eB, 'A', delay,          spriteInfos[idxA]));
+    pkParts.push(buildPokemonSVG(idxB, defB, pathB, eA, eB, 'B', delay,          spriteInfos[idxB]));
+  }
+
   const pkDefs = pkParts.map(p => p.defs).filter(Boolean).join('\n  ');
   const pkSVGs = pkParts.map(p => p.svg).join('\n');
 
-  const tilePatterns = buildTilePatterns(TS);
-  const dungeonSVG   = dungeonToSVG(grid, W, H, TS);
-  const waterFX      = waterAnimSVG(grid, W, H, TS);
+  const dungeonSVG = dungeonToSVG(grid, W, H);
+  const waterFX    = waterAnimSVG(grid, W, H);
 
-  // Legend bar
+  // Legend
   const legY = SVG_H - LEG_H;
   const legend = POKEMON.map((def, i) => {
     const lx = 10 + i * Math.floor((SVG_W - 20) / POKEMON.length);
-    return `<circle cx="${lx + 4}" cy="${legY + 11}" r="4" fill="${def.color}"/>` +
-           `<text x="${lx + 11}" y="${legY + 15}" font-family="'Courier New',monospace" font-size="7" fill="#ccc">${def.name}</text>`;
+    return `<circle cx="${lx+4}" cy="${legY+11}" r="4" fill="${def.color}"/>` +
+           `<text x="${lx+11}" y="${legY+15}" font-family="'Courier New',monospace" font-size="7" fill="#ccc">${def.name}</text>`;
   }).join('');
 
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
      width="${SVG_W}" height="${SVG_H}" viewBox="0 0 ${SVG_W} ${SVG_H}">
 <style>
-@keyframes shimmer{0%,100%{opacity:.08}50%{opacity:.32}}
-.shimmer{animation:shimmer 2.2s ease-in-out infinite}
+@keyframes wsh{0%,100%{opacity:0.06}50%{opacity:0.35}}
+.wsh{animation:wsh 2.1s ease-in-out infinite}
 </style>
 <defs>
-  <radialGradient id="vignette" cx="50%" cy="50%" r="70%">
+  <radialGradient id="vignette" cx="50%" cy="50%" r="68%">
     <stop offset="0%"   stop-color="transparent"/>
-    <stop offset="100%" stop-color="rgba(0,0,12,0.60)"/>
+    <stop offset="100%" stop-color="rgba(0,0,14,0.62)"/>
   </radialGradient>
   <linearGradient id="titlegrad" x1="0" x2="1">
-    <stop offset="0%"   stop-color="#09091C"/>
-    <stop offset="50%"  stop-color="#101840"/>
-    <stop offset="100%" stop-color="#09091C"/>
+    <stop offset="0%"  stop-color="#080818"/>
+    <stop offset="50%" stop-color="#0E163A"/>
+    <stop offset="100%" stop-color="#080818"/>
   </linearGradient>
-  ${tilePatterns}
   ${pkDefs}
 </defs>
 
-<!-- background – same wall colour so edge tiles blend -->
-<rect width="${SVG_W}" height="${SVG_H}" fill="#1E1533"/>
+<!-- ── full-canvas background matches wall colour ── -->
+<rect width="${SVG_W}" height="${SVG_H}" fill="${C.bgDark}"/>
 
-<!-- dungeon tilemap -->
+<!-- ── dungeon tiles (inline rects, no SVG pattern) ── -->
 <g id="dungeon">${dungeonSVG}</g>
 
-<!-- water shimmer lines -->
-<g id="wfx" opacity="0.7">${waterFX}</g>
+<!-- ── water shimmer CSS lines ── -->
+<g id="wfx" opacity="0.75">${waterFX}</g>
 
-<!-- pokemon NPCs -->
+<!-- ── pokemon NPCs + battle animations ── -->
 <g id="npcs">${pkSVGs}</g>
 
-<!-- vignette -->
-<rect width="${SVG_W}" height="${SVG_H}" fill="url(#vignette)"/>
+<!-- ── vignette ── -->
+<rect width="${SVG_W}" height="${SVG_H}" fill="url(#vignette)" pointer-events="none"/>
 
-<!-- title bar -->
-<rect x="0" y="0" width="${SVG_W}" height="${TITLE_H}" fill="url(#titlegrad)" opacity="0.95"/>
-<text x="${SVG_W / 2}" y="18" text-anchor="middle"
+<!-- ── title bar ── -->
+<rect x="0" y="0" width="${SVG_W}" height="${TITLE_H}" fill="url(#titlegrad)" opacity="0.96"/>
+<text x="${SVG_W/2}" y="18" text-anchor="middle"
   font-family="'Courier New',Courier,monospace" font-size="11" font-weight="bold"
   fill="#88DDFF" letter-spacing="2">&#9670; POKEMON MYSTERY DUNGEON WORLD &#9670;</text>
 <line x1="0" y1="${TITLE_H}" x2="${SVG_W}" y2="${TITLE_H}" stroke="#1A3060" stroke-width="1"/>
 
-<!-- legend -->
-<rect x="0" y="${legY}" width="${SVG_W}" height="${LEG_H}" fill="rgba(0,0,0,0.72)"/>
+<!-- ── legend ── -->
+<rect x="0" y="${legY}" width="${SVG_W}" height="${LEG_H}" fill="rgba(0,0,0,0.76)"/>
 ${legend}
 
 </svg>
@@ -536,7 +561,7 @@ ${legend}
 
   mkdirSync('assets', { recursive: true });
   writeFileSync('assets/pokemon-world.svg', svg, 'utf8');
-  console.log(`\u2705  Written assets/pokemon-world.svg  (${(svg.length / 1024).toFixed(0)} KB)`);
+  console.log(`\u2705  Written assets/pokemon-world.svg  (${(svg.length/1024).toFixed(0)} KB)`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
