@@ -1,4 +1,4 @@
-﻿import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { dirname, join, basename } from 'path';
 import { get } from 'https';
 import { POKEMON_DEFS } from './src/config.js';
@@ -16,49 +16,24 @@ const ROW_MIN = 0;
 const ROW_MAX = MAP_H - 1;
 
 // ─── Battle / movement timing ─────────────────────────────────────────────────
-const STEP_DUR     = 0.20;    // seconds per tile (constant for ALL pokemon)
-const WALK_TILES   = 25;      // one-way walk steps (used by pair 0 / as default)
-// 4 exchange phases — varying durations for back-and-forth feel
+const STEP_DUR     = 0.20;    // seconds per tile
 const PHASES       = [0.40, 0.60, 0.45, 0.55];
-const PRE_DUR      = 0.20;    // face-off pause before first strike
-const POST_DUR     = 0.25;    // disengage pause after last strike
+const PRE_DUR      = 0.20;
+const POST_DUR     = 0.25;
 const BATTLE_TOTAL = PRE_DUR + PHASES.reduce((a, b) => a + b, 0) + POST_DUR; // 2.45 s
-// Each pair gets its own prime-ish cycle length → LCM(17,19,23) ≈ 7429s ≈ 2 hrs (never-ending)
-const SLEEP_DUR    = 6.55;    // pair 0 sleep — ~34% of 19s cycle
-const PAIR_DUR     = 2 * WALK_TILES * STEP_DUR + BATTLE_TOTAL + SLEEP_DUR;   // ≈19.00s
 
-// ─── Fractional phase boundaries (0-1 within PAIR_DUR) ───────────────────────
-const W_DUR  = WALK_TILES * STEP_DUR;   // 4.0 s
-const bs     = W_DUR / PAIR_DUR;                          // battle start
-const p0e    = bs   + PRE_DUR   / PAIR_DUR;               // pre-battle ends
-const p1e    = p0e  + PHASES[0] / PAIR_DUR;               // phase 0 ends (A attacked B)
-const p2e    = p1e  + PHASES[1] / PAIR_DUR;               // phase 1 ends (B attacked A)
-const p3e    = p2e  + PHASES[2] / PAIR_DUR;               // phase 2 ends (A attacked B)
-const p4e    = p3e  + PHASES[3] / PAIR_DUR;               // phase 3 ends (B attacked A)
-const be     = p4e  + POST_DUR  / PAIR_DUR;               // battle end, resume walk
-const bkend  = be   + W_DUR     / PAIR_DUR;               // backward walk done -> sleep
+// ─── Multi-round configuration ────────────────────────────────────────────────
+// Total animation: ROUND_DUR * 2, loops forever via repeatCount="indefinite"
+const ROUND_DUR = 30.0;      // seconds per round; all pokemon sleep here until next round
+const TOTAL_DUR = ROUND_DUR * 2;
 
-// ─── Per-pair timing helper (prime cycle lengths → LCM ≈ 2 hours) ────────────
-function makeTiming(walkTiles, sleepDur) {
-  const pairDur = 2 * walkTiles * STEP_DUR + BATTLE_TOTAL + sleepDur;
-  const wDur = walkTiles * STEP_DUR;
-  const bs_    = wDur / pairDur;
-  const p0e_   = bs_   + PRE_DUR   / pairDur;
-  const p1e_   = p0e_  + PHASES[0] / pairDur;
-  const p2e_   = p1e_  + PHASES[1] / pairDur;
-  const p3e_   = p2e_  + PHASES[2] / pairDur;
-  const p4e_   = p3e_  + PHASES[3] / pairDur;
-  const be_    = p4e_  + POST_DUR  / pairDur;
-  const bkend_ = be_   + wDur      / pairDur;
-  return { pairDur, walkTiles, wDur, bs: bs_, p0e: p0e_, p1e: p1e_, p2e: p2e_,
-           p3e: p3e_, p4e: p4e_, be: be_, bkend: bkend_ };
-}
-// Different walkTiles per pair → irrational periods → LCM ≈ 2 hrs of unique variation
-// Sleep kept to ~21% of cycle so pokemon spend most of the time walking/fighting
-const PAIR_TIMINGS = [
-  makeTiming(27, 3.7),   // ≈16.95s — pair 0
-  makeTiming(32, 4.1),   // ≈19.35s — pair 1
-  makeTiming(38, 5.0),   // ≈22.65s — pair 2
+// Pokemon indices: 0=Diancie 1=Ceruledge 2=IronValiant 3=Greninja 4=Armarouge 5=Yveltal
+// Fixed home room per pokemon (6×2 grid; row0=rooms 0-5, row1=rooms 6-11)
+const PK_HOME = [0, 1, 5, 6, 11, 10];
+
+const ROUNDS = [
+  { pairs: [[0,2],[1,5],[3,4]], delays: [0, 0, 0],   walkTiles: [27, 32, 38] }, // R1: simultaneous
+  { pairs: [[0,2],[1,4],[3,5]], delays: [0, 5, 10],  walkTiles: [27, 32, 38] }, // R2: staggered
 ];
 
 const SEED    = 42;
@@ -373,45 +348,50 @@ function waterAnimSVG(grid, W, H) {
   return lines.join('');
 }
 
-// ─── Build pair paths with collision avoidance ────────────────────────────────
-function buildPairPaths(rooms, grid, W, H, ridxA, ridxB, avoidTiles, hardBlocks, timing) {
-  const wt = timing.walkTiles;
-  const rA = rooms[ridxA], rB = rooms[ridxB];
-  const full = dijkstraPath(grid, W, H, rA.cx, rA.cy, rB.cx, rB.cy, avoidTiles, hardBlocks);
-  const K = full.length - 1;
-  const m = Math.max(1, K >> 1);
+// ─── Build paths for one round — independent collision avoidance per round ────
+function buildRoundPaths(roundDef, rooms, grid, W, H) {
+  const avoidTiles = new Set();
+  const hardBlocks = new Set();
 
-  let pathA = full.slice(0, m + 1);
-  let pathB = full.slice(m + 1).reverse();
-  if (pathB.length < 2) pathB = [{ ...full[K] }, { ...full[K] }];
+  return roundDef.pairs.map((pair, pi) => {
+    const [pkA, pkB] = pair;
+    const rA = rooms[PK_HOME[pkA]], rB = rooms[PK_HOME[pkB]];
+    const wt = roundDef.walkTiles[pi];
+    const delay = roundDef.delays[pi];
 
-  function normalisePath(path) {
-    while (path.length < wt + 1) path.unshift({ ...path[0] });
-    if (path.length > wt + 1) path = path.slice(path.length - (wt + 1));
-    return path;
-  }
-  pathA = normalisePath(pathA);
-  pathB = normalisePath(pathB);
+    const full = dijkstraPath(grid, W, H, rA.cx, rA.cy, rB.cx, rB.cy, avoidTiles, hardBlocks);
+    const m = Math.max(1, (full.length - 1) >> 1);
 
-  // Register tiles so later pairs route around them (soft avoid)
-  pathA.forEach(p => avoidTiles.add(`${p.x},${p.y}`));
-  pathB.forEach(p => avoidTiles.add(`${p.x},${p.y}`));
-  // Hard-block home (sleep) tiles so later pairs never walk through them
-  hardBlocks.add(`${pathA[0].x},${pathA[0].y}`);
-  hardBlocks.add(`${pathB[0].x},${pathB[0].y}`);
+    let pathA = full.slice(0, m + 1);
+    let pathB = full.slice(m + 1).reverse();
+    if (pathB.length < 2) pathB = [{ ...full[full.length - 1] }, { ...full[full.length - 1] }];
 
-  const avgYA = pathA.reduce((s, p) => s + p.y, 0) / pathA.length;
-  const avgYB = pathB.reduce((s, p) => s + p.y, 0) / pathB.length;
-  return { pathA, pathB, eA: pathA[wt], eB: pathB[wt], avgYA, avgYB };
+    const norm = path => {
+      while (path.length < wt + 1) path.unshift({ ...path[0] });
+      return path.length > wt + 1 ? path.slice(path.length - (wt + 1)) : path;
+    };
+    pathA = norm(pathA);
+    pathB = norm(pathB);
+
+    pathA.forEach(p => avoidTiles.add(`${p.x},${p.y}`));
+    pathB.forEach(p => avoidTiles.add(`${p.x},${p.y}`));
+    hardBlocks.add(`${pathA[0].x},${pathA[0].y}`);
+    hardBlocks.add(`${pathB[0].x},${pathB[0].y}`);
+
+    const eA = pathA[wt], eB = pathB[wt];
+    const wDur = wt * STEP_DUR;
+    return {
+      pkA, pkB, pathA, pathB, eA, eB, wt, wDur, delay,
+      avgYA: pathA.reduce((s, p) => s + p.y, 0) / pathA.length,
+      avgYB: pathB.reduce((s, p) => s + p.y, 0) / pathB.length,
+    };
+  });
 }
 
-// ─── Build a single pokemon's full SMIL animation ────────────────────────────
-// role 'A' attacks in phases 0 & 2, role 'B' attacks in phases 1 & 3
-function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo, timing) {
-  if (!spriteInfo) return { defs: '', svg: '' };
-
-  // Per-pair timing — override all globals
-  const { pairDur, walkTiles, bs, p0e, p1e, p2e, p3e, p4e, be, bkend } = timing;
+// ─── Build multi-round SMIL for one pokemon ───────────────────────────────────
+// roundInfos: array of {path, eA, eB, role, delay, wDur, wt}, one per round
+function buildMultiRoundPokemonSVG(pkIdx, roundInfos, spriteInfo) {
+  if (!spriteInfo) return { defs: '', svg: '', avgY: 0 };
 
   const {
     walkUri, sheetW, sheetH, frameW, frameH, frameCount, durSec,
@@ -420,80 +400,175 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo, 
     slpUri,  slpSheetW,  slpSheetH,  slpFrameW,  slpFrameH,  slpFrameCount,  slpDurSec,
   } = spriteInfo;
 
-  const SS  = SPRITE_SCALE;
+  const SS = SPRITE_SCALE;
   const dfw = frameW, dfh = frameH;
-  const hw  = dfw >> 1, hh = dfh >> 1;
-
-  // ── Position keyTimes and values ─────────────────────────────────────────────
-  const pathRev = [...path].reverse();
-
-  const allKts = [
-    ...Array.from({ length: walkTiles + 1 }, (_, i) => i * STEP_DUR / pairDur),
-    be,
-    ...Array.from({ length: walkTiles }, (_, i) => be + (i + 1) * STEP_DUR / pairDur),
-    1.0,
-  ];
-
+  const hw = dfw >> 1, hh = dfh >> 1;
   const pixPos = t => `${f1(t.x * TS + TS / 2)},${f1(t.y * TS + TS / 2)}`;
-  const allPos = [
-    ...path.map(pixPos),
-    pixPos(path[walkTiles]),
-    ...pathRev.slice(1).map(pixPos),
-    pixPos(path[0]),
-  ];
+  const sprYForRow = row => -(hh + row * dfh) * SS;
 
-  const ktStr  = allKts.map(f5).join(';');
-  const posStr = allPos.join(';');
+  // Absolute-time event lists (t in seconds, v = string or number value)
+  const posEvents  = [];
+  const dirEvents  = [];
+  const walkEvents = [];
+  const slpEvents  = [];
+  const strkEvents = [];
+  const hrtEvents  = [];
+  const flashEvents = [];
 
-  // Walk direction Y-offset per keyframe (scaled)
-  const opponent = role === 'A' ? eB : eA;
-  const dirY = (from, to) => -(hh + dirRow(to.x - from.x, to.y - from.y) * dfh) * SS;
-  const allDirY = [
-    ...Array.from({ length: walkTiles + 1 }, (_, i) => {
-      const from = path[i], to = path[Math.min(i + 1, walkTiles)];
-      return dirY(from, to);
-    }),
-    dirY(path[walkTiles], opponent),
-    ...Array.from({ length: walkTiles }, (_, i) => {
-      const from = pathRev[i + 1], to = pathRev[Math.min(i + 2, walkTiles)];
-      return dirY(from, to);
-    }),
-    -hh * SS,  // sleep: row 0
-  ];
+  let totalAvgY = 0;
 
+  for (let ri = 0; ri < roundInfos.length; ri++) {
+    const { path, eA, eB, role, delay, wDur, wt } = roundInfos[ri];
+    const rOff = ri * ROUND_DUR;
+    const pathRev = [...path].reverse();
+
+    const walkStart  = rOff + delay;
+    const battleStart = walkStart + wDur;
+    const p0e = battleStart + PRE_DUR;
+    const p1e = p0e + PHASES[0];
+    const p2e = p1e + PHASES[1];
+    const p3e = p2e + PHASES[2];
+    const p4e = p3e + PHASES[3];
+    const battleEnd  = battleStart + BATTLE_TOTAL;
+    const returnEnd  = battleEnd + wDur;
+    const roundEnd   = rOff + ROUND_DUR;
+
+    totalAvgY += path.reduce((s, p) => s + p.y, 0) / path.length;
+
+    // ── Position ────────────────────────────────────────────────────────────────
+    posEvents.push({ t: rOff, v: pixPos(path[0]) });
+    if (delay > 0) posEvents.push({ t: walkStart, v: pixPos(path[0]) });
+    for (let i = 0; i <= wt; i++)
+      posEvents.push({ t: walkStart + i * STEP_DUR, v: pixPos(path[i]) });
+    posEvents.push({ t: battleEnd, v: pixPos(path[wt]) });
+    for (let i = 1; i <= wt; i++)
+      posEvents.push({ t: battleEnd + i * STEP_DUR, v: pixPos(pathRev[i]) });
+    posEvents.push({ t: roundEnd, v: pixPos(path[0]) });
+
+    // ── Direction (sprite Y row offset) ─────────────────────────────────────────
+    const walkDir = (i) => {
+      const from = path[i], to = path[Math.min(i + 1, wt)];
+      return sprYForRow(dirRow(to.x - from.x, to.y - from.y));
+    };
+    if (delay > 0) dirEvents.push({ t: rOff, v: walkDir(0) });
+    for (let i = 0; i <= wt; i++)
+      dirEvents.push({ t: walkStart + i * STEP_DUR, v: walkDir(i) });
+    const faceRow = role === 'A'
+      ? dirRow(eB.x - eA.x, eB.y - eA.y)
+      : dirRow(eA.x - eB.x, eA.y - eB.y);
+    dirEvents.push({ t: battleStart, v: sprYForRow(faceRow) });
+    dirEvents.push({ t: battleEnd,   v: sprYForRow(faceRow) });
+    for (let i = 1; i <= wt; i++) {
+      const from = pathRev[i - 1], to = pathRev[i];
+      dirEvents.push({ t: battleEnd + (i - 1) * STEP_DUR, v: sprYForRow(dirRow(to.x - from.x, to.y - from.y)) });
+    }
+    dirEvents.push({ t: returnEnd, v: sprYForRow(0) }); // sleep faces south
+    dirEvents.push({ t: roundEnd,  v: sprYForRow(0) });
+
+    // ── Walk sprite display ──────────────────────────────────────────────────────
+    walkEvents.push({ t: rOff,        v: 'inline' });
+    walkEvents.push({ t: battleStart, v: 'none'   });
+    walkEvents.push({ t: battleEnd,   v: 'inline' });
+    walkEvents.push({ t: returnEnd,   v: 'none'   });
+    walkEvents.push({ t: roundEnd,    v: 'none'   });
+
+    // ── Sleep sprite display ─────────────────────────────────────────────────────
+    slpEvents.push({ t: rOff,       v: 'none'   });
+    slpEvents.push({ t: returnEnd,  v: 'inline' });
+    slpEvents.push({ t: roundEnd,   v: 'none'   });
+
+    // ── Strike / Hurt display ────────────────────────────────────────────────────
+    strkEvents.push({ t: rOff, v: 'none' });
+    hrtEvents.push(  { t: rOff, v: 'none' });
+    if (role === 'A') {
+      strkEvents.push({ t: p0e, v: 'inline' }); strkEvents.push({ t: p1e, v: 'none' });
+      strkEvents.push({ t: p2e, v: 'inline' }); strkEvents.push({ t: p3e, v: 'none' });
+      hrtEvents.push(  { t: p1e, v: 'inline' }); hrtEvents.push(  { t: p2e, v: 'none' });
+      hrtEvents.push(  { t: p3e, v: 'inline' }); hrtEvents.push(  { t: p4e, v: 'none' });
+    } else {
+      strkEvents.push({ t: p1e, v: 'inline' }); strkEvents.push({ t: p2e, v: 'none' });
+      strkEvents.push({ t: p3e, v: 'inline' }); strkEvents.push({ t: p4e, v: 'none' });
+      hrtEvents.push(  { t: p0e, v: 'inline' }); hrtEvents.push(  { t: p1e, v: 'none' });
+      hrtEvents.push(  { t: p2e, v: 'inline' }); hrtEvents.push(  { t: p3e, v: 'none' });
+    }
+    strkEvents.push({ t: roundEnd, v: 'none' });
+    hrtEvents.push(  { t: roundEnd, v: 'none' });
+
+    // ── Hit-flash ────────────────────────────────────────────────────────────────
+    const FD = 0.3;
+    flashEvents.push({ t: rOff, v: 0 });
+    const hitTimes = role === 'A' ? [p1e, p3e] : [p0e, p2e];
+    for (const ht of hitTimes) {
+      flashEvents.push({ t: ht,      v: 0    });
+      flashEvents.push({ t: ht + FD, v: 0.55 });
+      flashEvents.push({ t: ht + FD * 2, v: 0 });
+    }
+    flashEvents.push({ t: roundEnd, v: 0 });
+  }
+
+  // ── Sort + deduplicate (same t → keep last) ────────────────────────────────
+  function sortDedup(events) {
+    events.sort((a, b) => a.t - b.t);
+    const out = [];
+    for (const e of events) {
+      if (out.length && Math.abs(out[out.length - 1].t - e.t) < 1e-9)
+        out[out.length - 1].v = e.v;
+      else out.push({ ...e });
+    }
+    return out;
+  }
+
+  function toSMIL(events, defaultEnd) {
+    const sd = sortDedup(events);
+    if (!sd.length) return { kts: '0;1', vals: `${defaultEnd};${defaultEnd}` };
+    if (sd[0].t > 1e-9) sd.unshift({ t: 0, v: sd[0].v });
+    if (sd[sd.length - 1].t < TOTAL_DUR - 1e-9) sd.push({ t: TOTAL_DUR, v: sd[sd.length - 1].v });
+    return {
+      kts:  sd.map(e => f5(e.t / TOTAL_DUR)).join(';'),
+      vals: sd.map(e => String(e.v)).join(';'),
+    };
+  }
+
+  const posSMIL   = toSMIL(posEvents,   pixPos(roundInfos[0].path[0]));
+  const dirSMIL   = toSMIL(dirEvents,   sprYForRow(0));
+  const walkSMIL  = toSMIL(walkEvents,  'none');
+  const slpSMIL   = toSMIL(slpEvents,   'none');
+  const strkSMIL  = toSMIL(strkEvents,  'none');
+  const hrtSMIL   = toSMIL(hrtEvents,   'none');
+  const flashSMIL = toSMIL(flashEvents, 0);
+  const avgY = totalAvgY / roundInfos.length;
+
+  // ── SMIL elements ─────────────────────────────────────────────────────────────
   const clipId = `wc${pkIdx}`;
   let defsStr = `<clipPath id="${clipId}"><rect x="${-hw*SS}" y="${-hh*SS}" width="${dfw*SS}" height="${dfh*SS}"/></clipPath>`;
 
-  // ── Walk sprite ───────────────────────────────────────────────────────────────
   const walkXVals = Array.from({ length: frameCount }, (_, f) => -(hw + f * dfw) * SS).join(';');
   const walkImg = `<image id="w${pkIdx}" href="${walkUri}"
       x="${-hw*SS}" y="${-hh*SS}" width="${sheetW*SS}" height="${sheetH*SS}" image-rendering="pixelated" clip-path="url(#${clipId})">
-    <animate attributeName="x" values="${walkXVals}" dur="${durSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="y" values="${allDirY.join(';')}" keyTimes="${ktStr}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="display" values="inline;none;inline;none" keyTimes="0;${f5(bs)};${f5(be)};${f5(bkend)}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="x" values="${walkXVals}" dur="${durSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="y" values="${dirSMIL.vals}" keyTimes="${dirSMIL.kts}" dur="${TOTAL_DUR.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="${walkSMIL.vals}" keyTimes="${walkSMIL.kts}" dur="${TOTAL_DUR.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
 
-  // ── Strike / Hurt sprites ─────────────────────────────────────────────────────
   let strkImg = '', hrtImg = '', slpImg = '';
+
   if (strkUri && hrtUri) {
     const adfw = strkFrameW, adfh = strkFrameH;
     const ahw = adfw >> 1, ahh = adfh >> 1;
     const aClipId = `ac${pkIdx}`;
     defsStr += `\n  <clipPath id="${aClipId}"><rect x="${-ahw*SS}" y="${-ahh*SS}" width="${adfw*SS}" height="${adfh*SS}"/></clipPath>`;
 
-    const strkFaceDir = role === 'A'
-      ? dirRow(eB.x - eA.x, eB.y - eA.y)
-      : dirRow(eA.x - eB.x, eA.y - eB.y);
-    const strkY = -(ahh + strkFaceDir * adfh) * SS;
+    const info0 = roundInfos[0];
+    const strkFaceRow = info0.role === 'A'
+      ? dirRow(info0.eB.x - info0.eA.x, info0.eB.y - info0.eA.y)
+      : dirRow(info0.eA.x - info0.eB.x, info0.eA.y - info0.eB.y);
+    const strkY = -(ahh + strkFaceRow * adfh) * SS;
     const strkXVals = Array.from({ length: strkFrameCount }, (_, f) => -(ahw + f * adfw) * SS).join(';');
-    const strkKt = role === 'A'
-      ? `0;${f5(p0e)};${f5(p1e)};${f5(p2e)};${f5(p3e)}`
-      : `0;${f5(p1e)};${f5(p2e)};${f5(p3e)};${f5(p4e)}`;
 
     strkImg = `<image id="a${pkIdx}" href="${strkUri}"
       x="${-ahw*SS}" y="${strkY}" width="${strkSheetW*SS}" height="${strkSheetH*SS}" image-rendering="pixelated" clip-path="url(#${aClipId})">
-    <animate attributeName="x" values="${strkXVals}" dur="${strkDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="display" values="none;inline;none;inline;none" keyTimes="${strkKt}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="x" values="${strkXVals}" dur="${strkDurSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="${strkSMIL.vals}" keyTimes="${strkSMIL.kts}" dur="${TOTAL_DUR.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
 
     const hdfw = hrtFrameW, hdfh = hrtFrameH;
@@ -501,76 +576,70 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo, 
     const hClipId = `hc${pkIdx}`;
     defsStr += `\n  <clipPath id="${hClipId}"><rect x="${-hhw*SS}" y="${-hhh*SS}" width="${hdfw*SS}" height="${hdfh*SS}"/></clipPath>`;
 
-    const hrtFaceDir = role === 'A'
-      ? dirRow(eB.x - eA.x, eB.y - eA.y)
-      : dirRow(eA.x - eB.x, eA.y - eB.y);
-    const hrtY = -(hhh + hrtFaceDir * hdfh) * SS;
+    const hrtFaceRow = info0.role === 'A'
+      ? dirRow(info0.eB.x - info0.eA.x, info0.eB.y - info0.eA.y)
+      : dirRow(info0.eA.x - info0.eB.x, info0.eA.y - info0.eB.y);
+    const hrtY = -(hhh + hrtFaceRow * hdfh) * SS;
     const hrtXVals = Array.from({ length: hrtFrameCount }, (_, f) => -(hhw + f * hdfw) * SS).join(';');
-    const hrtKt = role === 'A'
-      ? `0;${f5(p1e)};${f5(p2e)};${f5(p3e)};${f5(p4e)}`
-      : `0;${f5(p0e)};${f5(p1e)};${f5(p2e)};${f5(p3e)}`;
 
     hrtImg = `<image id="h${pkIdx}" href="${hrtUri}"
       x="${-hhw*SS}" y="${hrtY}" width="${hrtSheetW*SS}" height="${hrtSheetH*SS}" image-rendering="pixelated" clip-path="url(#${hClipId})">
-    <animate attributeName="x" values="${hrtXVals}" dur="${hrtDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="display" values="none;inline;none;inline;none" keyTimes="${hrtKt}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="x" values="${hrtXVals}" dur="${hrtDurSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="${hrtSMIL.vals}" keyTimes="${hrtSMIL.kts}" dur="${TOTAL_DUR.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
   }
 
-  // ── Sleep sprite ──────────────────────────────────────────────────────────────
   if (slpUri) {
     const sfW = slpFrameW, sfH = slpFrameH;
     const shw = sfW >> 1, shh = sfH >> 1;
     const slpClipId = `sc${pkIdx}`;
     defsStr += `\n  <clipPath id="${slpClipId}"><rect x="${-shw*SS}" y="${-shh*SS}" width="${sfW*SS}" height="${sfH*SS}"/></clipPath>`;
     const slpXVals = Array.from({ length: slpFrameCount }, (_, f) => -(shw + f * sfW) * SS).join(';');
+
     slpImg = `<image id="s${pkIdx}" href="${slpUri}"
       x="${-shw*SS}" y="${-shh*SS}" width="${slpSheetW*SS}" height="${slpSheetH*SS}" image-rendering="pixelated" clip-path="url(#${slpClipId})">
-    <animate attributeName="x" values="${slpXVals}" dur="${slpDurSec.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="display" values="none;inline" keyTimes="0;${f5(bkend)}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="x" values="${slpXVals}" dur="${slpDurSec.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="${slpSMIL.vals}" keyTimes="${slpSMIL.kts}" dur="${TOTAL_DUR.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
   </image>`;
   }
 
-  // ── Hit-flash ─────────────────────────────────────────────────────────────────
-  const fd = 0.3 / pairDur;
-  const flashKt = role === 'A'
-    ? `0;${f5(p1e)};${f5(p1e+fd)};${f5(p2e)};${f5(p3e)};${f5(p3e+fd)};${f5(p4e)}`
-    : `0;${f5(p0e)};${f5(p0e+fd)};${f5(p1e)};${f5(p2e)};${f5(p2e+fd)};${f5(p3e)}`;
   const flashImg = `<circle cx="0" cy="0" r="${TS * 0.7}" fill="white" opacity="0">
-    <animate attributeName="opacity" values="0;0;0.55;0;0;0.55;0" keyTimes="${flashKt}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="${flashSMIL.vals}" keyTimes="${flashSMIL.kts}" dur="${TOTAL_DUR.toFixed(3)}s" calcMode="linear" repeatCount="indefinite"/>
   </circle>`;
 
-  const shadowY      = f1(hh * SS * 0.42);
-  const shadowRx     = f1(dfw * SS * 0.36);
-  const shadowRy     = f1(TS * 0.12);
-  const shadowYSleep = f1(hh * SS * 0.88);
+  const shadowY       = f1(hh * SS * 0.42);
+  const shadowRx      = f1(dfw * SS * 0.36);
+  const shadowRy      = f1(TS * 0.12);
+  const shadowYSleep  = f1(hh * SS * 0.88);
   const shadowRySleep = f1(TS * 0.07);
+  const shadowCyVals  = slpSMIL.vals.replace(/inline/g, shadowYSleep).replace(/none/g, shadowY);
+  const shadowRyVals  = slpSMIL.vals.replace(/inline/g, shadowRySleep).replace(/none/g, shadowRy);
+
   const shadowEll = `<ellipse cx="0" cy="${shadowY}" rx="${shadowRx}" ry="${shadowRy}" fill="rgba(0,0,0,0.55)">
-    <animate attributeName="cy" values="${shadowY};${shadowY};${shadowYSleep}" keyTimes="0;${f5(bkend)};1" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
-    <animate attributeName="ry" values="${shadowRy};${shadowRy};${shadowRySleep}" keyTimes="0;${f5(bkend)};1" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="cy" values="${shadowCyVals}" keyTimes="${slpSMIL.kts}" dur="${TOTAL_DUR.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="ry" values="${shadowRyVals}" keyTimes="${slpSMIL.kts}" dur="${TOTAL_DUR.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
   </ellipse>`;
 
-  // ── ZZZ sleep bubbles ─────────────────────────────────────────────────────────
   const zx1 = f1(dfw * SS * 0.25), zx2 = f1(dfw * SS * 0.40), zx3 = f1(dfw * SS * 0.55);
   const zy0 = f1(-hh * SS * 0.9);
   const zzzImg = `<g>
-    <animate attributeName="display" values="none;inline" keyTimes="0;${f5(bkend)}" dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s" calcMode="discrete" repeatCount="indefinite"/>
+    <animate attributeName="display" values="${slpSMIL.vals}" keyTimes="${slpSMIL.kts}" dur="${TOTAL_DUR.toFixed(3)}s" calcMode="discrete" repeatCount="indefinite"/>
     <text x="${zx1}" font-size="11" fill="white" font-family="monospace" font-weight="bold" text-anchor="middle">
-      <animate attributeName="y" values="${zy0};${f1(-hh*SS*1.55)}" dur="1.8s" begin="${delaySec.toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>
-      <animate attributeName="opacity" values="0;0.9;0" dur="1.8s" begin="${delaySec.toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>z</text>
+      <animate attributeName="y" values="${zy0};${f1(-hh*SS*1.55)}" dur="1.8s" calcMode="linear" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;0.9;0" dur="1.8s" calcMode="linear" repeatCount="indefinite"/>z</text>
     <text x="${zx2}" font-size="9" fill="white" font-family="monospace" font-weight="bold" text-anchor="middle">
-      <animate attributeName="y" values="${zy0};${f1(-hh*SS*1.7)}" dur="1.8s" begin="${(delaySec+0.6).toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>
-      <animate attributeName="opacity" values="0;0.75;0" dur="1.8s" begin="${(delaySec+0.6).toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>z</text>
+      <animate attributeName="y" values="${zy0};${f1(-hh*SS*1.7)}" dur="1.8s" begin="0.6s" calcMode="linear" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;0.75;0" dur="1.8s" begin="0.6s" calcMode="linear" repeatCount="indefinite"/>z</text>
     <text x="${zx3}" font-size="7" fill="white" font-family="monospace" font-weight="bold" text-anchor="middle">
-      <animate attributeName="y" values="${zy0};${f1(-hh*SS*1.9)}" dur="1.8s" begin="${(delaySec+1.2).toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>
-      <animate attributeName="opacity" values="0;0.55;0" dur="1.8s" begin="${(delaySec+1.2).toFixed(2)}s" calcMode="linear" repeatCount="indefinite"/>z</text>
+      <animate attributeName="y" values="${zy0};${f1(-hh*SS*1.9)}" dur="1.8s" begin="1.2s" calcMode="linear" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;0.55;0" dur="1.8s" begin="1.2s" calcMode="linear" repeatCount="indefinite"/>z</text>
   </g>`;
 
   const svg = `
   <g id="pk${pkIdx}">
     <animateTransform attributeName="transform" type="translate"
-      values="${posStr}" keyTimes="${ktStr}"
-      dur="${pairDur.toFixed(3)}s" begin="${delaySec.toFixed(2)}s"
+      values="${posSMIL.vals}" keyTimes="${posSMIL.kts}"
+      dur="${TOTAL_DUR.toFixed(3)}s"
       calcMode="linear" repeatCount="indefinite" additive="replace"/>
     ${shadowEll}
     ${walkImg}
@@ -581,14 +650,14 @@ function buildPokemonSVG(pkIdx, _def, path, eA, eB, role, delaySec, spriteInfo, 
     ${flashImg}
   </g>`;
 
-  return { defs: defsStr, svg };
+  return { defs: defsStr, svg, avgY };
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log('Generating PMD dungeon SVG ...');
+  console.log('Generating PMD dungeon SVG (multi-round) ...');
   console.log(`  Map: ${MAP_W}x${MAP_H} tiles at ${TS}px`);
-  PAIR_TIMINGS.forEach((t, i) => console.log(`  Pair ${i}: ${t.walkTiles} tiles, pairDur=${t.pairDur.toFixed(2)}s, sleep=${(t.pairDur*(1-t.bkend)).toFixed(2)}s (${((1-t.bkend)*100).toFixed(0)}%)`));
+  console.log(`  Cycle: ${TOTAL_DUR}s total (${ROUND_DUR}s×${ROUNDS.length} rounds)`);
 
   // Load sprites: walk + strike + hurt + sleep
   const spriteInfos = POKEMON.map(def => {
@@ -628,9 +697,6 @@ async function main() {
   });
 
   // ── Download dungeon tileset from PMDCollab/RawAsset ─────────────────────────
-  // SealedRuin tileset: 432×192 (18×8 tiles), 3 sections of 6×8
-  // Section 0 (wall): x 0–143  | Section 1 (water): x 144–287 | Section 2 (floor): x 288–431
-  // Row 6 (y=144) = interior surrounded tiles — good default for inner floor/wall
   const DUNGEON_NAME = 'CrystalCave1';
   const TILESET_URL  = `https://raw.githubusercontent.com/PMDCollab/RawAsset/master/TileDtef/${DUNGEON_NAME}/tileset_0.png`;
   let tilesetUri = null;
@@ -642,26 +708,18 @@ async function main() {
     console.warn(`  ! Tileset download failed (${e.message}), using solid colours`);
   }
 
-  // Build pattern defs — multiple variants per type for visual variety
-  // CrystalCave1 layout: sec0 (wall) x=0-143, sec1 (water/corr) x=144-287, sec2 (floor) x=288-431
-  // Each section has 6 cols×8 rows of 24×24 tiles; row 6 (y=144) = fully-surrounded interior
   const patternDefs = tilesetUri ? [
-    // Wall interior variants — sec0, cols 2-5, row 6
     tilePattern('patWall0',     tilesetUri,  48, 144),
     tilePattern('patWall1',     tilesetUri,  72, 144),
     tilePattern('patWall2',     tilesetUri,  96, 144),
     tilePattern('patWall3',     tilesetUri, 120, 144),
-    // Wall edge variants (wall above open floor) — sec0, cols 2-3, row 1 (shows crystal tips)
     tilePattern('patWallEdge0', tilesetUri,  48,  24),
     tilePattern('patWallEdge1', tilesetUri,  72,  24),
-    // Floor variants — sec2, cols 3-5, row 6
     tilePattern('patFloor0',    tilesetUri, 360, 144),
     tilePattern('patFloor1',    tilesetUri, 384, 144),
     tilePattern('patFloor2',    tilesetUri, 408, 144),
-    // Corridor variants — sec2, cols 1-2, row 5
     tilePattern('patCorr0',     tilesetUri, 312, 120),
     tilePattern('patCorr1',     tilesetUri, 336, 120),
-    // Water — sec1, col 4, row 6
     tilePattern('patWater',     tilesetUri, 240, 144),
   ].join('\n  ') : '';
 
@@ -669,40 +727,34 @@ async function main() {
   const { grid, rooms, W, H } = generateDungeon();
   console.log(`  Dungeon: ${rooms.length} rooms (${W}x${H} tiles)`);
 
-  // Build paths with spatial collision avoidance (each pair prefers unused tiles)
-  const avoidTiles = new Set();
-  const hardBlocks = new Set();
-  // 6×2 room layout: room idx = ry*COLS+rx, COLS=6, ROWS=2
-  // Rooms spread across map; pokemon indices shuffled for varied matchups:
-  //   0=Diancie  1=Ceruledge  2=IronValiant  3=Greninja  4=Armarouge  5=Yveltal
-  const pairRoomIdxs = [
-    [0,  5],   // top-left  ↔ top-right
-    [1, 10],   // top-col1  ↔ bottom-col4
-    [6, 11],   // bot-left  ↔ bot-right
-  ];
-  // Each pair: [pkIdxA, pkIdxB] — different matchups from the original defaults
-  const pkAssign = [
-    [0, 2],   // Diancie    vs Iron Valiant
-    [1, 5],   // Ceruledge  vs Yveltal
-    [3, 4],   // Greninja   vs Armarouge
-  ];
-  // All pairs start at t=0 — no staggered spawning
-  const pairDelays = [0, 0, 0];
+  // ── Build paths for each round (independent collision avoidance per round) ────
+  const allRoundPaths = ROUNDS.map((roundDef, ri) => {
+    const pkNames = roundDef.pairs.map(([a, b]) => `${POKEMON[a].name}↔${POKEMON[b].name}`).join(', ');
+    console.log(`  Round ${ri + 1}: ${pkNames}  delays=${roundDef.delays}`);
+    return buildRoundPaths(roundDef, rooms, grid, W, H);
+  });
 
-  const pkParts = [];
-  for (let pairIdx = 0; pairIdx < 3; pairIdx++) {
-    const [ridxA, ridxB] = pairRoomIdxs[pairIdx];
-    const [idxA, idxB]   = pkAssign[pairIdx];
-    const timing = PAIR_TIMINGS[pairIdx];
-    const { pathA, pathB, eA, eB, avgYA, avgYB } = buildPairPaths(rooms, grid, W, H, ridxA, ridxB, avoidTiles, hardBlocks, timing);
-    const delay = pairDelays[pairIdx];
-    console.log(`  Pair ${pairIdx}: ${POKEMON[idxA].name} (room ${ridxA}) <-> ${POKEMON[idxB].name} (room ${ridxB})`);
-    pkParts.push({ ...buildPokemonSVG(idxA, POKEMON[idxA], pathA, eA, eB, 'A', delay, spriteInfos[idxA], timing), avgY: avgYA });
-    pkParts.push({ ...buildPokemonSVG(idxB, POKEMON[idxB], pathB, eA, eB, 'B', delay, spriteInfos[idxB], timing), avgY: avgYB });
+  // ── Collect per-pokemon info across rounds ─────────────────────────────────
+  const pkRoundInfos = {};  // pkIdx → [{path,eA,eB,role,delay,wDur,wt}, ...]
+  for (let roundIdx = 0; roundIdx < ROUNDS.length; roundIdx++) {
+    for (const pair of allRoundPaths[roundIdx]) {
+      if (!pkRoundInfos[pair.pkA]) pkRoundInfos[pair.pkA] = [];
+      if (!pkRoundInfos[pair.pkB]) pkRoundInfos[pair.pkB] = [];
+      pkRoundInfos[pair.pkA].push({ path: pair.pathA, eA: pair.eA, eB: pair.eB, role: 'A', delay: pair.delay, wDur: pair.wDur, wt: pair.wt });
+      pkRoundInfos[pair.pkB].push({ path: pair.pathB, eA: pair.eA, eB: pair.eB, role: 'B', delay: pair.delay, wDur: pair.wDur, wt: pair.wt });
+    }
   }
 
-  // ── Y-sort: lower avgY (higher on screen) renders first → behind ──────────────
-  // Using average path Y gives accurate per-pair depth even for diagonal routes
+  // ── Build per-pokemon SVG ──────────────────────────────────────────────────
+  const pkParts = [];
+  for (const pkIdx of Object.keys(pkRoundInfos).map(Number).sort()) {
+    const infos = pkRoundInfos[pkIdx];
+    if (!spriteInfos[pkIdx]) { console.warn(`  ! No sprite for ${POKEMON[pkIdx].name}`); continue; }
+    console.log(`  ${POKEMON[pkIdx].name}: ${infos.length} rounds`);
+    pkParts.push(buildMultiRoundPokemonSVG(pkIdx, infos, spriteInfos[pkIdx]));
+  }
+
+  // ── Y-sort: lower avgY renders first (behind) ──────────────────────────────
   pkParts.sort((a, b) => a.avgY - b.avgY);
 
   const pkDefs = pkParts.map(p => p.defs).filter(Boolean).join('\n  ');
@@ -742,4 +794,3 @@ async function main() {
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
-
